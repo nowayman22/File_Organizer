@@ -746,5 +746,15 @@ class DetectStructureTests(unittest.TestCase):
             self.assertEqual(org.detect_folder_structure(dest), "file_type")
 
 
+class GetPhotoDateTests(unittest.TestCase):
+    def test_non_media_file_uses_filesystem_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "notes.txt"
+            f.write_bytes(b"hi")
+            os.utime(f, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+            self.assertAlmostEqual(
+                org.get_photo_date(f).timestamp(), 1_700_000_000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
