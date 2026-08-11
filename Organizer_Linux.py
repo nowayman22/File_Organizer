@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Photo Organizer (v3)
-====================
-A modern GUI application to copy or move photos/videos from a source drive
-or folder to a destination, sorted into folders by date or file type.
+File Organizer
+==============
+A modern GUI application to copy or move files of any type from a source
+drive or folder to a destination, sorted into folders by date or file type.
 
 v3 additions
 ------------
@@ -30,7 +30,7 @@ v3 additions
   * Profiles: save and load full sets of settings (operation, sort mode,
     duplicate handling, verify mode, paths, toggles, ...) from a
     dropdown in the header. Defaults shipped, custom profiles persist
-    to ~/.photo_organizer/profiles.json.
+    to ~/.file_organizer/profiles.json.
 
 v2 features (kept)
 ------------------
@@ -64,7 +64,7 @@ Requirements
 
 Run
 ---
-    python Organizer.py
+    python File_Organizer.py
 """
 
 from __future__ import annotations
@@ -478,7 +478,7 @@ KNOWN_TYPE_FOLDERS = {
 # =========================================================================== #
 #  Profiles                                                                    #
 # =========================================================================== #
-PROFILES_DIR  = Path.home() / ".photo_organizer"
+PROFILES_DIR  = Path.home() / ".file_organizer"
 PROFILES_FILE = PROFILES_DIR / "profiles.json"
 
 # Keys saved/restored when a profile is applied.
@@ -1048,7 +1048,10 @@ def get_mp4_creation_time(path: Path) -> Optional[datetime]:
 
 
 def get_photo_date(path: Path) -> datetime:
-    """Best-effort capture date for a photo OR video file.
+    """Best-effort capture date for any file.
+
+    Photos may have EXIF, MP4-family videos may have an embedded 'mvhd'
+    creation time; everything else falls back to filesystem mtime.
 
     Priority:
       1) EXIF DateTimeOriginal  (images, requires Pillow)
@@ -1519,7 +1522,7 @@ def apply_theme(root: tk.Tk, colors: dict) -> None:
 # =========================================================================== #
 #  App                                                                         #
 # =========================================================================== #
-class PhotoOrganizerApp:
+class FileOrganizerApp:
     # Severity levels for the structured logger.
     LVL_DEBUG, LVL_INFO, LVL_WARN, LVL_ERROR, LVL_SUCCESS, LVL_HEADER = (
         "DEBUG", "INFO", "WARN", "ERROR", "OK", "HEAD"
@@ -1527,7 +1530,7 @@ class PhotoOrganizerApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Photo Organizer")
+        self.root.title("File Organizer")
         self.root.geometry("1140x800")
         self.root.minsize(1020, 720)
 
@@ -1590,7 +1593,7 @@ class PhotoOrganizerApp:
         self.source_path.trace_add("write", lambda *_a: self._on_path_edited("source"))
         self.dest_path.trace_add("write", lambda *_a: self._on_path_edited("dest"))
 
-        self._log_header(f"Photo Organizer started  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self._log_header(f"File Organizer started  •  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self._log_info(f"Pillow EXIF support: {'available' if PIL_AVAILABLE else 'NOT installed (pip install Pillow)'}",
                        level=self.LVL_INFO if PIL_AVAILABLE else self.LVL_WARN)
         self._log_debug(f"Profiles loaded from {PROFILES_FILE}: {len(self.profiles)} entries")
@@ -1617,11 +1620,11 @@ class PhotoOrganizerApp:
         header = ttk.Frame(self.root, style="Header.TFrame", padding=(16, 10, 16, 6))
         header.pack(fill=tk.X)
 
-        ttk.Label(header, text="📷  Photo Organizer", style="Title.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, text="🗂  File Organizer", style="Title.TLabel").pack(side=tk.LEFT)
         if PIL_AVAILABLE:
-            subtitle = "EXIF + MP4/MOV date detection"
+            subtitle = "EXIF + MP4/MOV dates for photos & videos"
         else:
-            subtitle = "MP4/MOV dates OK  •  pip install Pillow for photo EXIF"
+            subtitle = "Dates via file time  •  pip install Pillow for EXIF"
         ttk.Label(header, text=subtitle, style="Muted.TLabel").pack(
             side=tk.LEFT, padx=(12, 0), pady=(6, 0))
 
@@ -2441,7 +2444,7 @@ class PhotoOrganizerApp:
         key = detect_folder_structure(p)
         if key is None:
             self.detect_label.configure(
-                text="No existing photo-library structure detected.",
+                text="No existing folder structure detected.",
                 foreground=self.colors["text_muted"])
             self._auto_detected_key = None
             return
@@ -3160,7 +3163,7 @@ class PhotoOrganizerApp:
             self._logfile_path = dest_path / f"organizer_{mode}_{stamp}.log"
             self._logfile_handle = open(self._logfile_path, "a", encoding="utf-8")
             self._logfile_handle.write(
-                f"\n=== Photo Organizer session log — "
+                f"\n=== File Organizer session log — "
                 f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             self._logfile_handle.write(
                 f"Source:      {self.source_path.get()}\n"
@@ -3286,9 +3289,9 @@ def main() -> None:
     palette = load_omarchy_palette()
     if palette is not None:
         THEMES["dark"] = palette      # "dark" *is* the Omarchy theme here
-    root = tk.Tk(className="PhotoOrganizer")   # WM_CLASS for the .desktop entry
+    root = tk.Tk(className="FileOrganizer")    # WM_CLASS for the .desktop entry
     resolve_fonts()          # swap Windows fonts for installed ones before any widgets
-    PhotoOrganizerApp(root)
+    FileOrganizerApp(root)
     root.mainloop()
 
 
