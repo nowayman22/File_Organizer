@@ -4,7 +4,9 @@ Run from the project root:  python -m unittest tests.test_organizer -v
 These tests never create Tk widgets, so they run headless.
 """
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -13,6 +15,9 @@ from pathlib import Path
 from unittest import mock
 
 import File_Organizer as org
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 LSBLK_FIXTURE = {
@@ -754,6 +759,31 @@ class GetPhotoDateTests(unittest.TestCase):
             os.utime(f, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
             self.assertAlmostEqual(
                 org.get_photo_date(f).timestamp(), 1_700_000_000.0)
+
+
+class PackagingTests(unittest.TestCase):
+    TEMPLATE = PROJECT_ROOT / "packaging" / "file-organizer.desktop"
+
+    def test_template_has_required_keys(self):
+        text = self.TEMPLATE.read_text()
+        for key in ("[Desktop Entry]", "Type=Application",
+                    "Name=File Organizer",
+                    "Comment=Copy or move files of any type, sorted by date or type",
+                    "Exec=python3 @PROJECT_DIR@/File_Organizer.py",
+                    "Icon=file-organizer", "Terminal=false",
+                    "Categories=Utility;FileTools;",
+                    "StartupWMClass=FileOrganizer"):
+            self.assertIn(key, text)
+
+    def test_template_has_project_dir_placeholder(self):
+        self.assertIn("@PROJECT_DIR@",
+                      self.TEMPLATE.read_text())
+
+    def test_startup_wm_class_matches_app_classname(self):
+        template = self.TEMPLATE.read_text()
+        wm = re.search(r"StartupWMClass=(\S+)", template).group(1)
+        source = (PROJECT_ROOT / "File_Organizer.py").read_text()
+        self.assertIn(f'className="{wm}"', source)
 
 
 if __name__ == "__main__":

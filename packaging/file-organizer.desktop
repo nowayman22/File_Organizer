@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=File Organizer
+Comment=Copy or move files of any type, sorted by date or type
+Exec=python3 @PROJECT_DIR@/File_Organizer.py
+Icon=file-organizer
+Terminal=false
+Categories=Utility;FileTools;
+StartupWMClass=FileOrganizer
+Keywords=files;organize;copy;move;sort;
