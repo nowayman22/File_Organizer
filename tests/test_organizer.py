@@ -737,5 +737,14 @@ class WalkFilesTests(unittest.TestCase):
             self.assertEqual(found, [])
 
 
+class DetectStructureTests(unittest.TestCase):
+    def test_detects_non_media_type_folders(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            (dest / "PDF").mkdir()
+            (dest / "ZIP").mkdir()
+            self.assertEqual(org.detect_folder_structure(dest), "file_type")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -464,6 +464,14 @@ KNOWN_TYPE_FOLDERS = {
     "ERF", "KDC", "MRW", "RWL", "X3F", "TIFF", "TIF", "GIF", "WEBP", "BMP",
     "JFIF", "MP4", "M4V", "MOV", "AVI", "MKV", "WMV", "FLV", "3GP", "MPG",
     "MPEG", "WEBM", "M2TS", "MTS", "VOB",
+    "PDF", "DOC", "DOCX", "XLS", "XLSX", "PPT", "PPTX", "ODT", "ODS",
+    "RTF", "TXT", "CSV", "MD", "EPUB",
+    "ZIP", "RAR", "7Z", "TAR", "GZ", "BZ2", "XZ", "ISO",
+    "MP3", "FLAC", "WAV", "AAC", "OGG", "M4A", "WMA",
+    "PY", "JS", "TS", "HTML", "CSS", "JSON", "XML", "YAML", "SH", "BAT",
+    "DB", "SQL", "EXE", "MSI", "DEB", "RPM", "APPIMAGE",
+    "PSD", "AI", "SVG", "TTF", "OTF",
+    "LOG", "INI", "CFG", "CONF", "TORRENT",
 }
 
 
