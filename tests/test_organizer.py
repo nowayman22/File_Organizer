@@ -847,6 +847,19 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse((Path(tmp) / ".local/share/icons/hicolor"
                               / "scalable/apps/file-organizer.svg").exists())
 
+    def test_reinstall_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            desktop = (Path(tmp) / ".local/share/applications"
+                       / "file-organizer.desktop")
+            icon = (Path(tmp) / ".local/share/icons/hicolor/scalable/apps"
+                    / "file-organizer.svg")
+            self.assertEqual(self._run(tmp).returncode, 0)
+            first = desktop.read_text()
+            self.assertEqual(self._run(tmp).returncode, 0)
+            self.assertEqual(desktop.read_text(), first)
+            self.assertTrue(desktop.is_file())
+            self.assertTrue(icon.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
