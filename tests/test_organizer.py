@@ -805,5 +805,48 @@ class SvgIconTests(unittest.TestCase):
             self.assertIn(color, text)
 
 
+class InstallerTests(unittest.TestCase):
+    INSTALLER = PROJECT_ROOT / "packaging" / "install.sh"
+
+    def _run(self, tmp: str, *args: str):
+        env = dict(os.environ)
+        env["HOME"] = tmp
+        return subprocess.run(
+            [str(self.INSTALLER), *args], cwd=tmp, env=env,
+            capture_output=True, text=True)
+
+    def test_installs_desktop_and_icon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(tmp)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            desktop = (Path(tmp) / ".local/share/applications"
+                       / "file-organizer.desktop")
+            icon = (Path(tmp) / ".local/share/icons/hicolor/scalable/apps"
+                    / "file-organizer.svg")
+            self.assertTrue(desktop.is_file())
+            self.assertTrue(icon.is_file())
+            self.assertIn(str(PROJECT_ROOT), desktop.read_text())
+
+    def test_removes_stale_photo_organizer_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            apps = Path(tmp) / ".local/share/applications"
+            apps.mkdir(parents=True)
+            stale = apps / "photo-organizer.desktop"
+            stale.write_text("[Desktop Entry]\n")
+            proc = self._run(tmp)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(stale.exists())
+
+    def test_uninstall_removes_installed_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run(tmp).returncode, 0)
+            proc = self._run(tmp, "--uninstall")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse((Path(tmp) / ".local/share/applications"
+                              / "file-organizer.desktop").exists())
+            self.assertFalse((Path(tmp) / ".local/share/icons/hicolor"
+                              / "scalable/apps/file-organizer.svg").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
