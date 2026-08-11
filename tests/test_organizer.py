@@ -1,4 +1,4 @@
-"""Unit tests for the pure helper functions in Organizer_Linux.py.
+"""Unit tests for the pure helper functions in File_Organizer.py.
 
 Run from the project root:  python -m unittest tests.test_organizer -v
 These tests never create Tk widgets, so they run headless.
@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import Organizer_Linux as org
+import File_Organizer as org
 
 
 LSBLK_FIXTURE = {
@@ -507,7 +507,7 @@ class LocationRecordTests(unittest.TestCase):
 
 class PersistenceTests(unittest.TestCase):
     def _patch_paths(self, tmp):
-        pdir = Path(tmp) / ".photo_organizer"
+        pdir = Path(tmp) / ".file_organizer"
         pfile = pdir / "profiles.json"
         return mock.patch.multiple(org, PROFILES_DIR=pdir, PROFILES_FILE=pfile)
 
