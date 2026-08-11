@@ -673,5 +673,69 @@ class OmarchyFingerprintTests(unittest.TestCase):
         self.assertIsNone(org.omarchy_theme_fingerprint(missing))
 
 
+class WalkFilesTests(unittest.TestCase):
+    def test_yields_any_extension_and_extensionless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "report.pdf").write_bytes(b"pdf")
+            (src / "song.mp3").write_bytes(b"mp3")
+            (src / "README").write_bytes(b"no ext")
+            cancel = threading.Event()
+            found = sorted(p.name for p in org.walk_files(src, True, cancel))
+            self.assertEqual(found, ["README", "report.pdf", "song.mp3"])
+
+    def test_skips_hidden_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / ".env").write_bytes(b"x")
+            (src / "keep.txt").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, True, cancel)]
+            self.assertEqual(found, ["keep.txt"])
+
+    def test_skips_hidden_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            hid = src / ".thumbnails"
+            hid.mkdir()
+            (hid / "t.png").write_bytes(b"x")
+            (src / "ok.png").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, True, cancel)]
+            self.assertEqual(found, ["ok.png"])
+
+    def test_skips_system_junk_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            junk = src / "System Volume Information"
+            junk.mkdir()
+            (junk / "data.bin").write_bytes(b"x")
+            (src / "good.txt").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, True, cancel)]
+            self.assertEqual(found, ["good.txt"])
+
+    def test_non_recursive_only_top_level_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            sub = src / "sub"
+            sub.mkdir()
+            (sub / "deep.txt").write_bytes(b"x")
+            (src / "top.txt").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, False, cancel)]
+            self.assertEqual(found, ["top.txt"])
+
+    def test_cancel_stops_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            for i in range(5):
+                (src / f"f{i}.txt").write_bytes(b"x")
+            cancel = threading.Event()
+            cancel.set()
+            found = list(org.walk_files(src, True, cancel))
+            self.assertEqual(found, [])
+
+
 if __name__ == "__main__":
     unittest.main()

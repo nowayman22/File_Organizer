@@ -399,7 +399,7 @@ def resolve_fonts() -> None:
 
 
 # =========================================================================== #
-#  Media extensions                                                            #
+# Extensions (used for embedded-date extraction)                               #
 # =========================================================================== #
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".jpe", ".jfif",
@@ -414,8 +414,6 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".avi", ".mkv", ".wmv", ".flv",
     ".3gp", ".mpg", ".mpeg", ".webm", ".m2ts", ".mts", ".vob",
 }
-
-MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 # Video formats whose creation date lives in the ISO-BMFF 'mvhd' atom.
 # Everything here can be parsed with pure stdlib (no external dependencies).
@@ -1296,29 +1294,33 @@ def detect_folder_structure(dest: Path) -> Optional[str]:
     return None
 
 
-def walk_media(source: Path, recurse: bool, cancel_event: threading.Event):
-    """Yield media files under `source`. Resilient against permission errors."""
+# System-junk directories we never descend into.
+SKIPPED_DIRS = {"System Volume Information", "$RECYCLE.BIN", "__MACOSX",
+                ".Spotlight-V100", ".Trashes", "lost+found"}
+
+
+def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
+    """Yield every ordinary file under `source`.
+
+    Skips hidden files/dirs (leading '.') and system junk directories.
+    Resilient against permission errors.
+    """
     if recurse:
         for root, dirs, files in os.walk(source, onerror=lambda e: None):
-            # Dotfiles (incl. .Trash-1000 / .Spotlight-V100 / .Trashes) are
-            # dropped by the startswith('.') check; the rest are non-dot junk
-            # dirs from Windows, macOS, and Linux filesystems.
             dirs[:] = [d for d in dirs if not d.startswith(".")
-                       and d not in ("System Volume Information", "$RECYCLE.BIN",
-                                     "__MACOSX", ".Spotlight-V100", ".Trashes",
-                                     "lost+found")]
+                       and d not in SKIPPED_DIRS]
             if cancel_event.is_set():
                 return
             for name in files:
-                ext = os.path.splitext(name)[1].lower()
-                if ext in MEDIA_EXTENSIONS:
-                    yield Path(root) / name
+                if name.startswith("."):
+                    continue
+                yield Path(root) / name
     else:
         try:
             for p in source.iterdir():
                 if cancel_event.is_set():
                     return
-                if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS:
+                if p.is_file() and not p.name.startswith("."):
                     yield p
         except (PermissionError, OSError):
             return
@@ -2477,7 +2479,7 @@ class PhotoOrganizerApp:
         files: list[Path] = []
         t0 = time.time()
         try:
-            for p in walk_media(source, recurse, self.cancel_event):
+            for p in walk_files(source, recurse, self.cancel_event):
                 files.append(p)
                 ext = p.suffix.lower()
                 counts[ext] += 1
@@ -2503,7 +2505,7 @@ class PhotoOrganizerApp:
         self.types_summary.configure(
             text=f"{total:,} files  •  {human_size(total_size)}  •  {len(counts)} file types")
         self._log_success(
-            f"Scan complete: {total:,} media files, {human_size(total_size)} "
+            f"Scan complete: {total:,} files, {human_size(total_size)} "
             f"across {len(counts)} types in {human_duration(elapsed)}.")
         # Per-type breakdown (verbose only or always for small counts)
         if total > 0:
@@ -2520,7 +2522,7 @@ class PhotoOrganizerApp:
         self.type_vars.clear()
 
         if not self.ext_counts:
-            ttk.Label(self.types_inner, text="No media files found.",
+            ttk.Label(self.types_inner, text="No files found.",
                       style="Muted.TLabel").pack(anchor="w")
             return
 
