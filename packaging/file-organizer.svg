@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- folder back (darker) -->
+  <path d="M32 96 L96 96 L112 80 L224 80 L224 208 L32 208 Z" fill="#3c3836"/>
+  <!-- folder front (accent) -->
+  <path d="M32 96 L32 208 L224 208 L224 96 Z" fill="#7daea3"/>
+  <!-- document sheet -->
+  <g transform="rotate(-6 176 128)">
+    <rect x="140" y="80" width="80" height="104" rx="10" fill="#282828" stroke="#3c3836" stroke-width="4"/>
+    <line x1="158" y1="112" x2="202" y2="112" stroke="#d4be98" stroke-width="6" stroke-linecap="round"/>
+    <line x1="158" y1="132" x2="202" y2="132" stroke="#7daea3" stroke-width="6" stroke-linecap="round"/>
+    <line x1="158" y1="152" x2="190" y2="152" stroke="#d4be98" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>

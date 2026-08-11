@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 import threading
 import time
 import unittest
@@ -784,6 +785,24 @@ class PackagingTests(unittest.TestCase):
         wm = re.search(r"StartupWMClass=(\S+)", template).group(1)
         source = (PROJECT_ROOT / "File_Organizer.py").read_text()
         self.assertIn(f'className="{wm}"', source)
+
+
+class SvgIconTests(unittest.TestCase):
+    ICON = PROJECT_ROOT / "packaging" / "file-organizer.svg"
+
+    def test_icon_is_well_formed_svg(self):
+        root = ET.parse(str(self.ICON)).getroot()
+        self.assertEqual(root.tag.split("}")[-1], "svg")
+
+    def test_icon_has_square_geometry(self):
+        root = ET.parse(str(self.ICON)).getroot()
+        parts = (root.get("viewBox") or "").replace(",", " ").split()
+        self.assertEqual(parts, ["0", "0", "256", "256"])
+
+    def test_icon_uses_omarchy_palette(self):
+        text = self.ICON.read_text()
+        for color in ("#7daea3", "#282828", "#d4be98"):
+            self.assertIn(color, text)
 
 
 if __name__ == "__main__":
