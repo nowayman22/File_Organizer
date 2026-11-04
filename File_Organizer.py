@@ -811,6 +811,40 @@ def scan_remote(spec: str, recursive: bool = True) -> list[RemoteEntry]:
     return entries
 
 
+def list_remote_dirs(spec: str) -> list[str]:
+    """Names of the folders directly under a remote folder."""
+    rc, out, err = run_rclone(["lsjson", spec], timeout=60)
+    if rc != 0:
+        raise RuntimeError(err.strip() or f"rclone lsjson failed ({rc})")
+    try:
+        items = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"could not parse rclone output: {e}") from e
+    names: list[str] = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or not item.get("IsDir"):
+            continue
+        name = str(item.get("Name") or "").strip("/")
+        if name and ".." not in Path(name).parts:
+            names.append(name)
+    return sorted(names)
+
+
+def remote_parent(spec: str) -> Optional[str]:
+    """Parent remote spec, or None when already at the remote root."""
+    remote, _, path = spec.partition(":")
+    path = path.strip("/")
+    if not path:
+        return None
+    head = path.rpartition("/")[0]
+    return f"{remote}:{head}" if head else f"{remote}:"
+
+
+def remote_child(spec: str, name: str) -> str:
+    """Join one folder name onto a remote spec."""
+    return join_remote(spec, name)
+
+
 def remote_stat(spec: str) -> Optional[RemoteEntry]:
     """One remote file, or None when it is absent/unreadable."""
     rc, out, _ = run_rclone(["lsjson", "--stat", "--hash", spec], timeout=60)
@@ -1921,6 +1955,7 @@ class FileOrganizerApp:
         self._auto_detected_key: Optional[str] = None
         self.usb_drives: list[UsbDrive] = []
         self.drive_remotes: list[str] = []
+        self._picker_state: dict = {}
         self._src_is_remote = False
         self._dest_is_remote = False
         self._remote_verify = False
@@ -2448,11 +2483,7 @@ class FileOrganizerApp:
     # ============================================================== #
     def _browse_source(self) -> None:
         if is_remote_path(self.source_path.get().strip()):
-            messagebox.showinfo(
-                "Google Drive path",
-                "This field holds a Drive path (remote:folder).\n\n"
-                "Type a folder, e.g.  gdrive:Photos\n"
-                "or pick a remote from the drive list.")
+            self._open_remote_picker("source")
             return
         p = filedialog.askdirectory(title="Select source drive or folder",
                                     initialdir=default_source_dir())
@@ -2462,17 +2493,116 @@ class FileOrganizerApp:
 
     def _browse_dest(self) -> None:
         if is_remote_path(self.dest_path.get().strip()):
-            messagebox.showinfo(
-                "Google Drive path",
-                "This field holds a Drive path (remote:folder).\n\n"
-                "Type a folder, e.g.  gdrive:FileOrganizer\n"
-                "or pick a remote from the drive list.")
+            self._open_remote_picker("dest")
             return
         p = filedialog.askdirectory(title="Select destination drive or folder",
                                     initialdir=default_dest_dir())
         if p:
             self.dest_path.set(p)
             self._log_debug(f"Destination set to: {p}")
+
+    # ---------------- Google Drive folder chooser ---------------- #
+    def _open_remote_picker(self, kind: str) -> None:
+        """Browse folders on a Drive remote and fill the path field."""
+        var = self.source_path if kind == "source" else self.dest_path
+        hint = self.src_drive_hint if kind == "source" else self.dst_drive_hint
+
+        spec = var.get().strip()
+        if not is_remote_path(spec):
+            remotes = list(getattr(self, "drive_remotes", [])) or list_remotes()
+            if not remotes:
+                messagebox.showerror(
+                    "No Drive remote",
+                    "No rclone remote is configured.\n\n"
+                    "Run  rclone config  once, then choose the remote from "
+                    "the drive list.")
+                return
+            spec = f"{remotes[0]}:"
+
+        win = tk.Toplevel(self.root)
+        win.title("Choose a Google Drive folder")
+        win.transient(self.root)
+        win.minsize(460, 340)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(2, weight=1)
+
+        header = ttk.Label(win, text=spec, font=("", 10, "bold"))
+        status = ttk.Label(win, text="Loading…")
+        listbox = tk.Listbox(
+            win, height=12, activestyle="dotbox",
+            bg=self.colors["bg_alt"], fg=self.colors["text"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["accent_fg"],
+            highlightthickness=1, highlightbackground=self.colors["border"],
+            bd=0)
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=listbox.yview)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        buttons = ttk.Frame(win)
+        open_btn = ttk.Button(buttons, text="Open", width=8)
+        use_btn = ttk.Button(buttons, text="Use this folder", width=16)
+        cancel_btn = ttk.Button(buttons, text="Cancel", width=8)
+
+        state = {"spec": spec, "entries": [], "window": win, "listbox": listbox}
+        self._picker_state = state
+
+        def refresh() -> None:
+            listbox.delete(0, tk.END)
+            state["entries"] = []
+            header.configure(text=state["spec"])
+            parent = remote_parent(state["spec"])
+            if parent is not None:
+                listbox.insert(tk.END, "⬆   .. (up one level)")
+                state["entries"].append(("up", parent))
+            status.configure(text="Loading…")
+            win.update_idletasks()
+            try:
+                names = list_remote_dirs(state["spec"])
+                status.configure(
+                    text=f"{len(names)} folder(s) — double-click to open")
+            except RuntimeError as e:
+                names = []
+                status.configure(text=f"{e} — this folder is created on upload")
+            for name in names:
+                listbox.insert(tk.END, f"📁   {name}")
+                state["entries"].append(("dir", remote_child(state["spec"], name)))
+            if state["entries"]:
+                listbox.selection_set(0)
+                listbox.activate(0)
+
+        def activate(_event=None) -> None:
+            selection = listbox.curselection()
+            if not selection:
+                return
+            _kind, target = state["entries"][selection[0]]
+            state["spec"] = target
+            refresh()
+
+        def use_folder() -> None:
+            var.set(state["spec"])
+            hint.configure(text="", foreground=self.colors["text_muted"])
+            self._log_debug(f"{kind} set from Drive folder picker: {state['spec']}")
+            win.destroy()
+
+        state["activate"] = activate
+        state["use"] = use_folder
+        state["refresh"] = refresh
+
+        header.grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 2))
+        status.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 6))
+        listbox.grid(row=2, column=0, sticky="nsew", padx=(12, 0))
+        scrollbar.grid(row=2, column=1, sticky="ns", padx=(0, 12))
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=12)
+        open_btn.pack(side=tk.LEFT, padx=4)
+        use_btn.pack(side=tk.LEFT, padx=4)
+        cancel_btn.pack(side=tk.LEFT, padx=4)
+        open_btn.configure(command=activate)
+        use_btn.configure(command=use_folder)
+        cancel_btn.configure(command=win.destroy)
+        listbox.bind("<Double-Button-1>", activate)
+        listbox.bind("<Return>", activate)
+        win.bind("<Escape>", lambda _e: win.destroy())
+        refresh()
 
     # ---------------- USB drive picker ---------------- #
     def _refresh_drives(self) -> None:

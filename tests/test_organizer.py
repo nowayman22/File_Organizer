@@ -1008,11 +1008,19 @@ elif cmd == "lsjson":
             sys.exit(3)
         print(json.dumps(record(target, target.parent)))
     else:
-        if not target.is_dir():
-            print("[]")
-            sys.exit(0)
+        if not target.exists():
+            sys.stderr.write("directory not found\n")
+            sys.exit(3)
         items = list(target.rglob("*")) if "-R" in flags else list(target.iterdir())
-        print(json.dumps([record(p, target) for p in sorted(items) if p.is_file()]))
+        payload = []
+        for p in sorted(items):
+            if p.is_dir():
+                payload.append({"Path": p.relative_to(target).as_posix(),
+                                "Name": p.name, "Size": -1, "IsDir": True,
+                                "ModTime": "", "Hashes": {}})
+            else:
+                payload.append(record(p, target))
+        print(json.dumps(payload))
 elif cmd == "copyto":
     src, dst = pos[0], pos[1]
     if os.environ.get("STUB_SLEEP"):
@@ -1155,6 +1163,22 @@ class RcloneBackendTests(unittest.TestCase):
         ok, err = org.delete_remote_file("testremote:Photos/b.bin")
         self.assertTrue(ok, err)
         self.assertFalse((self.remote_root / "Photos/b.bin").exists())
+
+    def test_list_remote_dirs_and_navigation(self):
+        self.put_remote("Photos/2024/a.jpg", b"x")
+        self.put_remote("Photos/Trips/b.jpg", b"y")
+        self.assertEqual(org.list_remote_dirs("testremote:Photos"),
+                         ["2024", "Trips"])
+        self.assertEqual(org.remote_parent("testremote:Photos/2024"),
+                         "testremote:Photos")
+        self.assertEqual(org.remote_parent("testremote:Photos"), "testremote:")
+        self.assertIsNone(org.remote_parent("testremote:"))
+        self.assertEqual(org.remote_child("testremote:Photos", "Trips"),
+                         "testremote:Photos/Trips")
+
+    def test_list_remote_dirs_reports_missing_folder(self):
+        with self.assertRaises(RuntimeError):
+            org.list_remote_dirs("testremote:DoesNotExist")
 
     def test_remote_quota(self):
         quota = org.remote_quota("testremote")
@@ -1358,6 +1382,28 @@ class GoogleDriveGuiTests(unittest.TestCase):
         stamp = datetime(2024, 1, 15, 12, 0).timestamp()
         os.utime(f, (stamp, stamp))
         return src
+
+    def test_folder_chooser_lists_and_selects_subfolder(self):
+        (self.remote_root / "FileOrganizer" / "Keep").mkdir(parents=True)
+        (self.remote_root / "FileOrganizer" / "Keep" / "x.jpg").write_bytes(b"x")
+        self.app.source_path.set("testremote:FileOrganizer")
+        self.app._open_remote_picker("source")
+        state = self.app._picker_state
+
+        dirs = [entry for entry in state["entries"] if entry[0] == "dir"]
+        self.assertIn(("dir", "testremote:FileOrganizer/Keep"), dirs)
+        self.assertIn(("up", "testremote:"), state["entries"])
+
+        target = ("dir", "testremote:FileOrganizer/Keep")
+        box = state["listbox"]
+        box.selection_clear(0, "end")
+        box.selection_set(state["entries"].index(target))
+        state["activate"]()
+        self.assertEqual(state["spec"], "testremote:FileOrganizer/Keep")
+
+        state["use"]()
+        self.assertEqual(self.app.source_path.get(),
+                         "testremote:FileOrganizer/Keep")
 
     def test_drive_picker_offers_configured_remotes(self):
         values = [str(v) for v in self.app.dst_drive_combo["values"]]

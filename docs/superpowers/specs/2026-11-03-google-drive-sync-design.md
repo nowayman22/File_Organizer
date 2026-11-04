@@ -49,8 +49,11 @@ is treated as a Drive path: `gdrive:FileOrganizer/Photos`. Requiring a configure
 remote means ordinary names such as `notes: 2024` are still local paths.
 
 This needs **no new widgets**: the source and destination path entries already exist,
-profiles persist paths as strings, and the drive picker can list remotes alongside USB
-drives. Browse buttons remain local-only (a remote path is typed or picked).
+profiles persist paths as strings, and the drive picker lists remotes alongside USB
+drives. When a field already holds a remote path, its browse button opens a **folder
+chooser** (double-click to descend, ⬆ to ascend, *Use this folder* to select); folders
+appear on upload, so a not-yet-existing path is selectable and reports that it will be
+created.
 
 Rejected: a separate Drive panel / backend dropdown — more UI, more state to keep in
 sync with profiles, no extra capability.
