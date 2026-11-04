@@ -3,6 +3,7 @@
 Run from the project root:  python -m unittest tests.test_organizer -v
 These tests never create Tk widgets, so they run headless.
 """
+import json
 import os
 import re
 import shutil
@@ -741,6 +742,93 @@ class WalkFilesTests(unittest.TestCase):
             cancel.set()
             found = list(org.walk_files(src, True, cancel))
             self.assertEqual(found, [])
+
+    def test_skips_dependency_trees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            for junk in ("node_modules", "venv", "__pycache__"):
+                d = src / junk
+                d.mkdir()
+                (d / "junk.js").write_bytes(b"x")
+            (src / "real.txt").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, True, cancel)]
+            self.assertEqual(found, ["real.txt"])
+
+    def test_skips_os_metadata_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            for meta in ("Thumbs.db", "desktop.ini", "ehthumbs.db"):
+                (src / meta).write_bytes(b"x")
+            (src / "real.txt").write_bytes(b"y")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(src, True, cancel)]
+            self.assertEqual(found, ["real.txt"])
+            found = [p.name for p in org.walk_files(src, False, cancel)]
+            self.assertEqual(found, ["real.txt"])
+
+
+class LegacyProfileMigrationTests(unittest.TestCase):
+    """The rebrand moved PROFILES_DIR; old profiles must not be abandoned."""
+
+    def _patch_paths(self, tmp):
+        pdir = Path(tmp) / ".file_organizer"
+        pfile = pdir / "profiles.json"
+        return pdir, pfile, mock.patch.multiple(
+            org, PROFILES_DIR=pdir, PROFILES_FILE=pfile)
+
+    def _write_legacy(self, tmp, payload):
+        legacy = Path(tmp) / ".photo_organizer"
+        legacy.mkdir()
+        (legacy / "profiles.json").write_text(
+            json.dumps(payload), encoding="utf-8")
+
+    def test_migrates_profiles_and_locations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_legacy(tmp, {
+                "profiles": {"Mine": {"operation": "move", "theme": "dark"}},
+                "last_used": "Mine",
+                "last_locations": {"source": {"path": "/src"},
+                                   "dest": {"path": "/dst"}},
+            })
+            pdir, pfile, patcher = self._patch_paths(tmp)
+            with patcher:
+                profiles, last_used, locations = org.load_profiles_from_disk()
+            self.assertEqual(profiles["Mine"]["operation"], "move")
+            self.assertEqual(last_used, "Mine")
+            self.assertEqual(locations["dest"]["path"], "/dst")
+            self.assertTrue(pfile.is_file())
+
+    def test_does_not_overwrite_existing_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_legacy(tmp, {"profiles": {"Legacy": {"theme": "light"}}})
+            pdir, pfile, patcher = self._patch_paths(tmp)
+            pdir.mkdir()
+            pfile.write_text(json.dumps({"profiles": {"New": {"theme": "dark"}}}),
+                             encoding="utf-8")
+            with patcher:
+                profiles, _, _ = org.load_profiles_from_disk()
+            self.assertIn("New", profiles)
+            self.assertNotIn("Legacy", profiles)
+
+    def test_corrupt_legacy_is_not_migrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = Path(tmp) / ".photo_organizer"
+            legacy.mkdir()
+            (legacy / "profiles.json").write_text("{not json", encoding="utf-8")
+            pdir, pfile, patcher = self._patch_paths(tmp)
+            with patcher:
+                profiles, _, _ = org.load_profiles_from_disk()
+            self.assertFalse(pfile.exists())
+            self.assertIn("Default — Copy by Year/Month", profiles)
+
+    def test_migration_runs_only_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_legacy(tmp, {"profiles": {"Mine": {"theme": "dark"}}})
+            pdir, pfile, patcher = self._patch_paths(tmp)
+            with patcher:
+                self.assertTrue(org.migrate_legacy_profiles())
+                self.assertFalse(org.migrate_legacy_profiles())
 
 
 class DetectStructureTests(unittest.TestCase):

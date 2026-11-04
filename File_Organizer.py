@@ -481,6 +481,11 @@ KNOWN_TYPE_FOLDERS = {
 PROFILES_DIR  = Path.home() / ".file_organizer"
 PROFILES_FILE = PROFILES_DIR / "profiles.json"
 
+# Store used by the pre-rebrand app ("Photo Organizer v3"). Its profiles.json
+# also holds the remembered source/destination locations, so it is migrated
+# once into the new store rather than silently abandoned after the rename.
+LEGACY_PROFILES_DIR_NAME = ".photo_organizer"
+
 # Keys saved/restored when a profile is applied.
 PROFILE_FIELDS = (
     "source_path", "dest_path",
@@ -549,11 +554,43 @@ DEFAULT_PROFILES: dict[str, dict] = {
 }
 
 
+def legacy_profiles_file() -> Path:
+    """Path of the pre-rebrand profiles.json sitting beside PROFILES_DIR."""
+    return PROFILES_DIR.parent / LEGACY_PROFILES_DIR_NAME / "profiles.json"
+
+
+def migrate_legacy_profiles() -> bool:
+    """Copy the pre-rebrand profiles.json into the new store, once.
+
+    Preserves custom profiles and the remembered locations across the
+    "Photo Organizer" -> "File Organizer" rename. Never overwrites an
+    existing new-store file, never deletes the legacy file, and refuses
+    to copy a file that is not a JSON object. Returns True on migration.
+    """
+    source = legacy_profiles_file()
+    if PROFILES_FILE.exists() or not source.exists():
+        return False
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    try:
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, PROFILES_FILE)
+        return True
+    except OSError:
+        return False
+
+
 def load_profiles_from_disk() -> tuple[dict[str, dict], Optional[str], dict]:
     """Return (profiles, last_used_name, last_locations).
 
-    Falls back to defaults / empty on any error.
+    Migrates the pre-rebrand store on first use, then falls back to
+    defaults / empty on any error.
     """
+    migrate_legacy_profiles()
     profiles: dict[str, dict] = {name: dict(data)
                                  for name, data in DEFAULT_PROFILES.items()}
     last_used: Optional[str] = None
@@ -1305,16 +1342,25 @@ def detect_folder_structure(dest: Path) -> Optional[str]:
     return None
 
 
-# System-junk directories we never descend into.
-SKIPPED_DIRS = {"System Volume Information", "$RECYCLE.BIN", "__MACOSX",
-                ".Spotlight-V100", ".Trashes", "lost+found"}
+# Noise a general-purpose organizer must never sweep into the destination.
+# Dot-prefixed names (.git, .venv, .cache) are already skipped by the walk.
+SKIPPED_DIRS = {
+    # cross-platform system junk
+    "System Volume Information", "$RECYCLE.BIN", "__MACOSX",
+    ".Spotlight-V100", ".Trashes", "lost+found",
+    # rebuildable dependency/cache trees, often huge and never user content
+    "node_modules", "venv", "__pycache__", "site-packages",
+}
+
+# OS metadata files that carry no user content.
+SKIPPED_FILES = {"Thumbs.db", "desktop.ini", "ehthumbs.db"}
 
 
 def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
     """Yield every ordinary file under `source`.
 
-    Skips hidden files/dirs (leading '.') and system junk directories.
-    Resilient against permission errors.
+    Skips hidden files/dirs (leading '.'), system junk directories, and
+    rebuildable dependency trees. Resilient against permission errors.
     """
     if recurse:
         for root, dirs, files in os.walk(source, onerror=lambda e: None):
@@ -1323,7 +1369,7 @@ def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
             if cancel_event.is_set():
                 return
             for name in files:
-                if name.startswith("."):
+                if name.startswith(".") or name in SKIPPED_FILES:
                     continue
                 yield Path(root) / name
     else:
@@ -1331,7 +1377,8 @@ def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
             for p in source.iterdir():
                 if cancel_event.is_set():
                     return
-                if p.is_file() and not p.name.startswith("."):
+                if (p.is_file() and not p.name.startswith(".")
+                        and p.name not in SKIPPED_FILES):
                     yield p
         except (PermissionError, OSError):
             return
