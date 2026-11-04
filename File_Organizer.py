@@ -639,6 +639,245 @@ def save_profiles_to_disk(profiles: dict[str, dict], last_used: Optional[str],
 
 
 # =========================================================================== #
+#  Google Drive (rclone backend)                                               #
+# =========================================================================== #
+# Google Drive is reached through the `rclone` CLI, the same way USB drives go
+# through lsblk/udisksctl: authentication, token refresh, resumable uploads,
+# retries and rate limiting all live in rclone, and the app stays stdlib-only.
+# Configure a remote once:
+#     rclone config          # name it e.g. "gdrive"
+# then use it anywhere a folder path is accepted, e.g. "gdrive:FileOrganizer".
+RCLONE_ENV_VAR = "FILE_ORGANIZER_RCLONE"   # override for tests / custom builds
+
+# A remote spec is "name:path" where name is what `rclone listremotes` reports.
+REMOTE_SPEC_RE = re.compile(
+    r"^(?P<remote>[A-Za-z0-9][A-Za-z0-9_.\-]*):(?P<path>.*)$")
+
+
+class RemoteEntry(NamedTuple):
+    """One file on a remote, carrying its full remote spec."""
+    path: str                            # e.g. "gdrive:FileOrganizer/2024/a.jpg"
+    size: int
+    modtime: Optional[datetime] = None
+    md5: Optional[str] = None
+
+    @property
+    def name(self) -> str:
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def suffix(self) -> str:
+        return Path(self.name).suffix
+
+    def __str__(self) -> str:            # keeps log lines readable
+        return self.path
+
+
+def rclone_bin() -> Optional[str]:
+    """Path to the rclone executable, or None when it is unavailable."""
+    override = os.environ.get(RCLONE_ENV_VAR)
+    if override:
+        return override if Path(override).is_file() else shutil.which(override)
+    return shutil.which("rclone")
+
+
+def run_rclone(args: list[str], timeout: int = 120) -> tuple[int, str, str]:
+    """Run rclone non-interactively. Returns (returncode, stdout, stderr)."""
+    binary = rclone_bin()
+    if binary is None:
+        return 127, "", "rclone is not installed"
+    try:
+        proc = subprocess.run([binary, *args], capture_output=True, text=True,
+                              timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def list_remotes() -> list[str]:
+    """Configured rclone remote names, e.g. ['gdrive']. Empty if unavailable."""
+    rc, out, _ = run_rclone(["listremotes"], timeout=20)
+    if rc != 0:
+        return []
+    return [line.strip().rstrip(":") for line in out.splitlines() if line.strip()]
+
+
+def split_remote_spec(spec: str) -> Optional[tuple[str, str]]:
+    """Split 'remote:path' into (remote, path); None when it is not a spec."""
+    m = REMOTE_SPEC_RE.match(spec.strip())
+    if not m:
+        return None
+    return m.group("remote"), m.group("path").strip("/")
+
+
+def is_remote_path(spec: str, remotes: Optional[list[str]] = None) -> bool:
+    """True when `spec` names a *configured* rclone remote.
+
+    Requiring a configured remote keeps ordinary names such as "notes: 2024"
+    from being mistaken for a remote spec.
+    """
+    parsed = split_remote_spec(spec)
+    if parsed is None:
+        return False
+    if remotes is None:
+        remotes = list_remotes()
+    return parsed[0] in remotes
+
+
+def join_remote(spec: str, *parts: str) -> str:
+    """Append relative POSIX parts to a remote spec, rejecting traversal."""
+    parsed = split_remote_spec(spec)
+    if parsed is None:
+        raise ValueError(f"not a remote path: {spec!r}")
+    remote, base = parsed
+    segments = [base] if base else []
+    for part in parts:
+        text = str(part).replace(os.sep, "/").strip("/")
+        if text in ("", "."):
+            continue
+        if ".." in Path(text).parts:
+            raise ValueError(f"refusing to escape the remote: {part!r}")
+        segments.append(text)
+    return f"{remote}:" + "/".join(segments)
+
+
+def _parse_remote_time(text) -> Optional[datetime]:
+    if not isinstance(text, str) or not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _remote_entry(spec: str, item: dict) -> Optional[RemoteEntry]:
+    """Convert one `rclone lsjson` record into a RemoteEntry (None for dirs)."""
+    if not isinstance(item, dict) or item.get("IsDir"):
+        return None
+    rel = str(item.get("Path") or item.get("Name") or "").strip("/")
+    if not rel or ".." in Path(rel).parts:
+        return None
+    hashes = item.get("Hashes")
+    md5 = hashes.get("md5") if isinstance(hashes, dict) else None
+    try:
+        size = int(item.get("Size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return RemoteEntry(join_remote(spec, rel), size,
+                       _parse_remote_time(item.get("ModTime")),
+                       md5 if isinstance(md5, str) else None)
+
+
+def scan_remote(spec: str, recursive: bool = True) -> list[RemoteEntry]:
+    """List files under a remote folder. Raises RuntimeError on failure."""
+    args = ["lsjson", "--hash", spec]
+    if recursive:
+        args.append("-R")
+    rc, out, err = run_rclone(args, timeout=300)
+    if rc != 0:
+        raise RuntimeError(err.strip() or f"rclone lsjson failed ({rc})")
+    try:
+        items = json.loads(out or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"could not parse rclone output: {e}") from e
+    entries: list[RemoteEntry] = []
+    for item in items if isinstance(items, list) else []:
+        entry = _remote_entry(spec, item)
+        if entry is not None:
+            entries.append(entry)
+    return entries
+
+
+def remote_stat(spec: str) -> Optional[RemoteEntry]:
+    """One remote file, or None when it is absent/unreadable."""
+    rc, out, _ = run_rclone(["lsjson", "--stat", "--hash", spec], timeout=60)
+    if rc != 0:
+        return None
+    try:
+        item = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(item, dict):
+        return None
+    # `lsjson --stat` reports Path relative to the parent of the leaf, so build
+    # the entry from the requested spec rather than the returned record.
+    hashes = item.get("Hashes")
+    md5 = hashes.get("md5") if isinstance(hashes, dict) else None
+    try:
+        size = int(item.get("Size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return RemoteEntry(spec, size, _parse_remote_time(item.get("ModTime")),
+                       md5 if isinstance(md5, str) else None)
+
+
+def upload_file(local: Path, spec: str) -> tuple[bool, str]:
+    rc, _, err = run_rclone(["copyto", str(local), spec, "--no-traverse"],
+                            timeout=3600)
+    return rc == 0, err.strip()
+
+
+def download_file(spec: str, local: Path) -> tuple[bool, str]:
+    try:
+        local.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return False, str(e)
+    rc, _, err = run_rclone(["copyto", spec, str(local), "--no-traverse"],
+                            timeout=3600)
+    return rc == 0, err.strip()
+
+
+def delete_remote_file(spec: str) -> tuple[bool, str]:
+    rc, _, err = run_rclone(["deletefile", spec], timeout=120)
+    return rc == 0, err.strip()
+
+
+def remote_quota(remote: str) -> Optional[dict]:
+    """Drive quota for a remote name (free/total bytes), or None."""
+    rc, out, _ = run_rclone(["about", f"{remote}:", "--json"], timeout=30)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def md5_of(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def remote_verify(local: Path, spec: str, mode: str) -> tuple[bool, str]:
+    """Verify a local file against its remote counterpart.
+
+    off -> always ok; quick -> size; hash -> size + MD5 when Drive reports one
+    (Google-native documents have no binary hash, so they verify by size).
+    """
+    if mode == "off":
+        return True, ""
+    entry = remote_stat(spec)
+    if entry is None:
+        return False, "not found on remote"
+    local_size = safe_size(local)
+    if entry.size != local_size:
+        return False, f"size {entry.size:,} != {local_size:,}"
+    if mode == "quick" or not entry.md5:
+        return True, ""
+    try:
+        local_md5 = md5_of(local)
+    except OSError as e:
+        return False, f"cannot hash local file: {e}"
+    if entry.md5.lower() != local_md5.lower():
+        return False, "MD5 mismatch"
+    return True, ""
+
+
+# =========================================================================== #
 #  Removable-drive detection                                                   #
 # =========================================================================== #
 class UsbDrive(NamedTuple):

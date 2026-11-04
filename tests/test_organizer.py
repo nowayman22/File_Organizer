@@ -949,5 +949,225 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(icon.is_file())
 
 
+# A stand-in for the real rclone binary. It implements just the subcommands the
+# app uses, backed by a directory, so Drive paths, hashes and transfers can be
+# tested end-to-end without network access or credentials.
+FAKE_RCLONE_SOURCE = r'''#!/usr/bin/env python3
+import hashlib, json, os, shutil, sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REMOTE = "testremote"
+ROOT = Path(os.environ.get("STUB_ROOT", "."))
+
+
+def md5_of(p):
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def record(p, base):
+    st = p.stat()
+    return {"Path": p.relative_to(base).as_posix(), "Name": p.name,
+            "Size": st.st_size, "IsDir": False,
+            "ModTime": datetime.fromtimestamp(st.st_mtime, timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "Hashes": {"md5": md5_of(p)}}
+
+
+def to_local(spec):
+    name, _, rest = spec.partition(":")
+    if name != REMOTE:
+        sys.stderr.write("unknown remote %s\n" % name)
+        sys.exit(2)
+    return ROOT / rest.strip("/")
+
+
+def is_spec(text):
+    return text.partition(":")[0] == REMOTE
+
+
+args = sys.argv[1:]
+cmd = args[0] if args else ""
+rest = args[1:]
+flags = [a for a in rest if a.startswith("-")]
+pos = [a for a in rest if not a.startswith("-")]
+
+if cmd == "listremotes":
+    print(REMOTE + ":")
+elif cmd == "lsjson":
+    target = to_local(pos[0])
+    if "--stat" in flags:
+        if not target.is_file():
+            sys.stderr.write("object not found\n")
+            sys.exit(3)
+        print(json.dumps(record(target, target.parent)))
+    else:
+        if not target.is_dir():
+            print("[]")
+            sys.exit(0)
+        items = list(target.rglob("*")) if "-R" in flags else list(target.iterdir())
+        print(json.dumps([record(p, target) for p in sorted(items) if p.is_file()]))
+elif cmd == "copyto":
+    src, dst = pos[0], pos[1]
+    if is_spec(src):
+        src_path, dst_path = to_local(src), Path(dst)
+    else:
+        src_path, dst_path = Path(src), to_local(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src_path, dst_path)
+elif cmd == "deletefile":
+    to_local(pos[0]).unlink()
+elif cmd == "about":
+    print(json.dumps({"total": 1000, "used": 250, "free": 750, "trashed": 0}))
+else:
+    sys.stderr.write("unsupported: %s\n" % cmd)
+    sys.exit(2)
+'''
+
+
+class RcloneBackendTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.root = root
+        self.remote_root = root / "remote"
+        self.remote_root.mkdir()
+        binary = root / "bin" / "rclone"
+        binary.parent.mkdir()
+        binary.write_text(FAKE_RCLONE_SOURCE)
+        binary.chmod(0o755)
+        self.bin = binary
+        self._env = mock.patch.dict(os.environ, {
+            org.RCLONE_ENV_VAR: str(binary),
+            "STUB_ROOT": str(self.remote_root),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def put_remote(self, rel, content):
+        p = self.remote_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
+
+    def local_file(self, name="a.txt", content=b"hello"):
+        p = self.root / "local" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
+
+    def test_list_remotes(self):
+        self.assertEqual(org.list_remotes(), ["testremote"])
+
+    def test_split_and_join(self):
+        self.assertEqual(org.split_remote_spec("gdrive:Photos/2024"),
+                         ("gdrive", "Photos/2024"))
+        self.assertIsNone(org.split_remote_spec("/home/user/photos"))
+        self.assertEqual(org.join_remote("testremote:Photos", "2024", "a.jpg"),
+                         "testremote:Photos/2024/a.jpg")
+        self.assertEqual(org.join_remote("testremote:"), "testremote:")
+
+    def test_join_rejects_traversal(self):
+        with self.assertRaises(ValueError):
+            org.join_remote("testremote:Photos", "..", "etc")
+        with self.assertRaises(ValueError):
+            org.join_remote("not-a-spec")
+
+    def test_is_remote_path_requires_configured_remote(self):
+        self.assertTrue(org.is_remote_path("testremote:Photos"))
+        self.assertFalse(org.is_remote_path("elsewhere:Photos"))
+        self.assertFalse(org.is_remote_path("/home/user/Photos"))
+        self.assertFalse(org.is_remote_path("notes: 2024"))
+
+    def test_scan_remote_recursive(self):
+        self.put_remote("Photos/2024/a.jpg", b"aaa")
+        self.put_remote("Photos/2024/sub/b.jpg", b"bbbb")
+        entries = org.scan_remote("testremote:Photos")
+        self.assertEqual(sorted(e.name for e in entries), ["a.jpg", "b.jpg"])
+        self.assertEqual({e.name: e.size for e in entries},
+                         {"a.jpg": 3, "b.jpg": 4})
+        self.assertTrue(all(e.md5 for e in entries))
+        self.assertTrue(all(e.modtime is not None for e in entries))
+
+    def test_scan_remote_flat_lists_direct_children(self):
+        self.put_remote("Photos/top.jpg", b"x")
+        self.put_remote("Photos/sub/deep.jpg", b"yy")
+        entries = org.scan_remote("testremote:Photos", recursive=False)
+        self.assertEqual([e.name for e in entries], ["top.jpg"])
+
+    def test_remote_stat_present_and_absent(self):
+        self.put_remote("Photos/a.jpg", b"abc")
+        entry = org.remote_stat("testremote:Photos/a.jpg")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.size, 3)
+        self.assertIsNone(org.remote_stat("testremote:Photos/missing.jpg"))
+
+    def test_upload_then_verify(self):
+        local = self.local_file(content=b"payload-123")
+        spec = "testremote:Photos/2024/a.txt"
+        ok, err = org.upload_file(local, spec)
+        self.assertTrue(ok, err)
+        self.assertTrue((self.remote_root / "Photos/2024/a.txt").is_file())
+        self.assertEqual(org.remote_verify(local, spec, "quick"), (True, ""))
+        self.assertEqual(org.remote_verify(local, spec, "hash"), (True, ""))
+        self.assertEqual(org.remote_verify(local, spec, "off"), (True, ""))
+
+    def test_verify_detects_size_then_hash_mismatch(self):
+        local = self.local_file(content=b"abcdef")
+        spec = "testremote:Photos/a.txt"
+        ok, err = org.upload_file(local, spec)
+        self.assertTrue(ok, err)
+
+        # same length, different bytes -> size passes, MD5 must fail
+        self.put_remote("Photos/a.txt", b"ABCDEF")
+        ok_quick, _ = org.remote_verify(local, spec, "quick")
+        ok_hash, why = org.remote_verify(local, spec, "hash")
+        self.assertTrue(ok_quick)
+        self.assertFalse(ok_hash)
+        self.assertIn("MD5", why)
+
+        # different length -> even quick fails
+        self.put_remote("Photos/a.txt", b"short")
+        ok_quick, why = org.remote_verify(local, spec, "quick")
+        self.assertFalse(ok_quick)
+        self.assertIn("size", why)
+
+    def test_missing_remote_file_fails_verify(self):
+        local = self.local_file()
+        self.assertEqual(org.remote_verify(local, "testremote:nope.txt", "quick"),
+                         (False, "not found on remote"))
+
+    def test_download_and_delete(self):
+        self.put_remote("Photos/b.bin", b"binary-bytes")
+        target = self.root / "out" / "b.bin"
+        ok, err = org.download_file("testremote:Photos/b.bin", target)
+        self.assertTrue(ok, err)
+        self.assertEqual(target.read_bytes(), b"binary-bytes")
+        ok, err = org.delete_remote_file("testremote:Photos/b.bin")
+        self.assertTrue(ok, err)
+        self.assertFalse((self.remote_root / "Photos/b.bin").exists())
+
+    def test_remote_quota(self):
+        quota = org.remote_quota("testremote")
+        self.assertEqual(quota["free"], 750)
+        self.assertEqual(quota["total"], 1000)
+
+    def test_missing_rclone_is_graceful(self):
+        with mock.patch.dict(os.environ,
+                             {org.RCLONE_ENV_VAR: "/nonexistent/rclone"}):
+            self.assertIsNone(org.rclone_bin())
+            self.assertEqual(org.list_remotes(), [])
+            self.assertFalse(org.is_remote_path("testremote:Photos"))
+            ok, err = org.upload_file(self.local_file(), "testremote:x")
+            self.assertFalse(ok)
+            self.assertIn("rclone", err)
+            self.assertIsNone(org.remote_quota("testremote"))
+
+
 if __name__ == "__main__":
     unittest.main()
