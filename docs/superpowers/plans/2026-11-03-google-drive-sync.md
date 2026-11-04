@@ -4,6 +4,8 @@
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
 > use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented on `feature/google-drive` — 118 tests pass.
+
 **Goal:** Push a local folder to Google Drive and pull a Drive folder to local, reusing the
 existing sort/duplicate/verify pipeline.
 
@@ -30,7 +32,7 @@ fake-rclone stub for tests.
 
 ### Task 1: rclone transport layer — DONE
 
-**Status:** landed on `feature/google-drive` with `RcloneBackendTests` (13 tests).
+**Status:** landed; `RcloneBackendTests` (14 tests) covers it, including cancellation.
 
 **Produces:** `RemoteEntry`, `rclone_bin`, `run_rclone`, `list_remotes`,
 `split_remote_spec`, `is_remote_path`, `join_remote`, `scan_remote`, `remote_stat`,
@@ -48,7 +50,7 @@ fake-rclone stub for tests.
 - Produces: scan list containing `Path` (local) or `RemoteEntry` (Drive) objects, both
   exposing `.name`, `.suffix`; `self.scanned_files` becomes `list[Path | RemoteEntry]`.
 
-- [ ] **Step 1: Add failing tests** — `scan_remote` already returns entries; the new
+- [x] **Step 1: Add failing tests** — `scan_remote` already returns entries; the new
   behaviour is selection logic. Extract it as a pure helper so it is testable:
 
 ```python
@@ -60,7 +62,7 @@ def remote_entries_of(files):
   Tests: `remote_entries_of([]) is False`; `remote_entries_of([RemoteEntry(...)])` true;
   `remote_entries_of([Path("a"), RemoteEntry(...)])` false.
 
-- [ ] **Step 2: Validate the source in `_start_scan`**
+- [x] **Step 2: Validate the source in `_start_scan`**
 
 ```python
 src = self.source_path.get().strip()
@@ -72,7 +74,7 @@ elif not src or not Path(src).is_dir():
     return
 ```
 
-- [ ] **Step 3: Branch `_scan_worker`**
+- [x] **Step 3: Branch `_scan_worker`**
 
 ```python
 if is_remote_path(str(source)):
@@ -86,9 +88,9 @@ else:
         ... existing body ...
 ```
 
-- [ ] **Step 4: Run the suite** — `python3 -m unittest tests.test_organizer -v`; existing
+- [x] **Step 4: Run the suite** — `python3 -m unittest tests.test_organizer -v`; existing
   tests plus the new helper test pass.
-- [ ] **Step 5: Commit** — `feat: scan a Google Drive folder as the source`.
+- [x] **Step 5: Commit** — `feat: scan a Google Drive folder as the source`.
 
 ---
 
@@ -105,17 +107,17 @@ else:
 - Consumes: `build_target_subfolder`, `upload_file`, `remote_verify`,
   `delete_remote_file` (not used by push).
 
-- [ ] **Step 1: Failing tests** for the three helpers: subfolder joining keeps POSIX
+- [x] **Step 1: Failing tests** for the three helpers: subfolder joining keeps POSIX
   separators; `_2`/`_3` probing stops at the first free name and gives up a `None`; a
   same-size/different-bytes remote is *not* a match under `hash`, but is under `quick`.
-- [ ] **Step 2: Implement helpers** (pure, no Tk).
-- [ ] **Step 3: Worker** `_push_worker(files, dest_spec, op, sort_key, dup, verify)` —
+- [x] **Step 2: Implement helpers** (pure, no Tk).
+- [x] **Step 3: Worker** `_push_worker(files, dest_spec, op, sort_key, dup, verify)` —
   mirrors `_transfer_worker`: per file compute subfolder, resolve duplicates against
   `remote_stat`, `upload_file`, then `remote_verify`; on `op == "move"` or
   `run_mode == "transfer_verify"` delete the local source only after a passing verify;
   on failed verify delete the remote copy (`delete_remote_file`) and keep the source.
   Progress via `self._tick_progress`; cancellation checked each iteration.
-- [ ] **Step 4: Dispatch** in `_start_run` when the destination is remote:
+- [x] **Step 4: Dispatch** in `_start_run` when the destination is remote:
 
 ```python
 src_remote = is_remote_path(src_text)
@@ -125,7 +127,7 @@ if src_remote and dst_remote:
     return
 ```
 
-- [ ] **Step 5: Run suite; commit** — `feat: push files to a Google Drive folder`.
+- [x] **Step 5: Run suite; commit** — `feat: push files to a Google Drive folder`.
 
 ---
 
@@ -143,17 +145,17 @@ if src_remote and dst_remote:
     `entry.modtime` (fallback: `datetime.now()`).
 - Consumes: `download_file`, `remote_verify`, `unique_destination`, `delete_remote_file`.
 
-- [ ] **Step 1: Failing tests** — `subfolder_for_date` reproduces every sort mode for a
+- [x] **Step 1: Failing tests** — `subfolder_for_date` reproduces every sort mode for a
   fixed date (characterization of the refactor: compare against
   `build_target_subfolder` on a temp file whose mtime is pinned); `pull_target` maps a
   `RemoteEntry` into the expected `dest/2024/01-January/x.jpg`.
-- [ ] **Step 2: Refactor + implement `pull_target`.**
-- [ ] **Step 3: Worker** `_pull_worker(entries, dest_root, op, sort_key, dup, verify)` —
+- [x] **Step 2: Refactor + implement `pull_target`.**
+- [x] **Step 3: Worker** `_pull_worker(entries, dest_root, op, sort_key, dup, verify)` —
   local duplicate rules as today (`skip`/`overwrite`/`rename`/`erase`); `erase` deletes
   the *remote* file when the local copy is identical; `op == "move"` deletes the remote
   file after a passing `remote_verify`; failed verification removes the partial local
   file and keeps the remote one.
-- [ ] **Step 4: Run suite; commit** — `feat: pull a Google Drive folder into a destination`.
+- [x] **Step 4: Run suite; commit** — `feat: pull a Google Drive folder into a destination`.
 
 ---
 
@@ -162,33 +164,33 @@ if src_remote and dst_remote:
 **Files:** `File_Organizer.py` (`_browse_*`, `_update_drives`, `_pick_drive`,
 `_start_run`, `_handle_verify_done`, log/status strings).
 
-- [ ] **Step 1:** `_update_drives` appends configured remotes to both drive pickers as
+- [x] **Step 1:** `_update_drives` appends configured remotes to both drive pickers as
   `☁ gdrive:` entries, so a Drive folder can be chosen without typing.
-- [ ] **Step 2:** `_browse_source`/`_browse_dest` refuse to open a local dialog when the
+- [x] **Step 2:** `_browse_source`/`_browse_dest` refuse to open a local dialog when the
   field holds a remote spec; they explain the `rclone config` workflow instead.
-- [ ] **Step 3:** Remote-aware verification: `_verify_remote_worker` compares each planned
+- [x] **Step 3:** Remote-aware verification: `_verify_remote_worker` compares each planned
   target (push) or each remote entry against the destination (pull) with size/MD5 and
   reuses the existing summary dialog, labelled "present / missing on Drive".
-- [ ] **Step 4:** Preflight in `_start_run`: missing rclone → one actionable error;
+- [x] **Step 4:** Preflight in `_start_run`: missing rclone → one actionable error;
   unconfigured remote → name it. Format-source stays disabled when the destination is
   remote.
-- [ ] **Step 5:** Update the subtitle/hints to mention Drive paths; keep the window
+- [x] **Step 5:** Update the subtitle/hints to mention Drive paths; keep the window
   layout unchanged.
-- [ ] **Step 6:** Run the suite headless; commit — `feat: address Drive folders in the
+- [x] **Step 6:** Run the suite headless; commit — `feat: address Drive folders in the
   source and destination fields`.
 
 ---
 
 ### Task 6: Docs and verification
 
-- [ ] **Step 1:** README: "Google Drive" section — `rclone config`, path form
+- [x] **Step 1:** README: "Google Drive" section — `rclone config`, path form
   (`gdrive:FileOrganizer`), operation/duplicate/verify semantics table, one-file-at-a-time
   note, cancellation behaviour.
-- [ ] **Step 2:** `python3 -m unittest tests.test_organizer -v` and
+- [x] **Step 2:** `python3 -m unittest tests.test_organizer -v` and
   `python3 -m py_compile File_Organizer.py`.
-- [ ] **Step 3:** Manual smoke (requires a configured remote): scan a small Drive folder,
+- [x] **Step 3:** Manual smoke (requires a configured remote): scan a small Drive folder,
   pull it, push it back, verify, then `erase` a duplicate pair.
-- [ ] **Step 4:** Commit and push the branch; open the PR into `main`.
+- [x] **Step 4:** Commit and push the branch; open the PR into `main`.
 
 ---
 

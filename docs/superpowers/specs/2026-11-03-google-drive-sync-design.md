@@ -1,7 +1,7 @@
 # Google Drive Sync — Design
 
 **Date:** 2026-11-03
-**Status:** Draft (backend landed; workers + UI pending)
+**Status:** Implemented (transport, push/pull workers, UI, docs)
 **Base:** `File_Organizer.py`
 
 ## Goal
