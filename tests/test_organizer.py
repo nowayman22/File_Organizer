@@ -745,6 +745,20 @@ class WalkFilesTests(unittest.TestCase):
             found = list(org.walk_files(src, True, cancel))
             self.assertEqual(found, [])
 
+    def test_honours_custom_skip_rules(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp)
+            (src / "keep").mkdir()
+            (src / "keep" / "a.txt").write_bytes(b"x")
+            (src / "SkipMe").mkdir()
+            (src / "SkipMe" / "b.txt").write_bytes(b"y")
+            (src / "Thumbs.db").write_bytes(b"z")
+            cancel = threading.Event()
+            found = [p.name for p in org.walk_files(
+                src, True, cancel, skip_dirs={"SkipMe"},
+                skip_files={"Thumbs.db"})]
+            self.assertEqual(found, ["a.txt"])
+
     def test_skips_dependency_trees(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp)
@@ -1035,6 +1049,15 @@ elif cmd == "deletefile":
     to_local(pos[0]).unlink()
 elif cmd == "about":
     print(json.dumps({"total": 1000, "used": 250, "free": 750, "trashed": 0}))
+elif cmd == "config":
+    if rest and rest[0] == "dump":
+        print(json.dumps({REMOTE: {"type": "drive", "scope": "drive"}}))
+    elif rest and rest[0] == "file":
+        print(str(ROOT / "rclone.conf"))
+    elif rest and rest[0] == "delete":
+        sys.exit(0)
+    else:
+        sys.exit(2)
 else:
     sys.stderr.write("unsupported: %s\n" % cmd)
     sys.exit(2)
@@ -1276,6 +1299,90 @@ class RemotePathTests(unittest.TestCase):
                          ("gdrive:a.tar", ".gz"))
 
 
+class SettingsTests(unittest.TestCase):
+    def _patch(self, tmp):
+        pdir = Path(tmp) / ".file_organizer"
+        return mock.patch.multiple(
+            org, PROFILES_DIR=pdir, SETTINGS_FILE=pdir / "settings.json")
+
+    def test_defaults_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._patch(tmp):
+                settings = org.load_settings()
+        self.assertEqual(set(settings["skipped_dirs"]), org.SKIPPED_DIRS)
+        self.assertEqual(set(settings["skipped_files"]), org.SKIPPED_FILES)
+        self.assertEqual(settings["drive_folder"], org.DEFAULT_DRIVE_FOLDER)
+
+    def test_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self._patch(tmp):
+                err = org.save_settings({"skipped_dirs": ["node_modules", "build"],
+                                         "skipped_files": ["Thumbs.db"],
+                                         "drive_folder": "/Photos/"})
+                self.assertIsNone(err)
+                settings = org.load_settings()
+        self.assertEqual(settings["skipped_dirs"], ["build", "node_modules"])
+        self.assertEqual(settings["skipped_files"], ["Thumbs.db"])
+        self.assertEqual(settings["drive_folder"], "Photos")
+
+    def test_invalid_file_falls_back_to_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / ".file_organizer"
+            pdir.mkdir()
+            (pdir / "settings.json").write_text("{not json", encoding="utf-8")
+            with self._patch(tmp):
+                settings = org.load_settings()
+        self.assertEqual(set(settings["skipped_dirs"]), org.SKIPPED_DIRS)
+
+
+class RcloneConfigHelperTests(unittest.TestCase):
+    def _fake_binary(self, tmp):
+        binary = Path(tmp) / "rclone"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        return binary
+
+    def test_config_dump_parses_and_degrades(self):
+        with mock.patch.object(org, "run_rclone",
+                               return_value=(0, '{"gdrive": {"type": "drive"}}', "")):
+            self.assertEqual(org.rclone_config_dump(),
+                             {"gdrive": {"type": "drive"}})
+        with mock.patch.object(org, "run_rclone", return_value=(1, "", "boom")):
+            self.assertEqual(org.rclone_config_dump(), {})
+        with mock.patch.object(org, "run_rclone", return_value=(0, "oops", "")):
+            self.assertEqual(org.rclone_config_dump(), {})
+
+    def test_config_delete(self):
+        with mock.patch.object(org, "run_rclone", return_value=(0, "", "")) as run:
+            self.assertEqual(org.rclone_config_delete("gdrive"), (True, ""))
+        run.assert_called_once_with(["config", "delete", "gdrive"], timeout=60)
+        with mock.patch.object(org, "run_rclone", return_value=(1, "", "nope")):
+            self.assertEqual(org.rclone_config_delete("gdrive"), (False, "nope"))
+
+    def test_config_argv_uses_TERMINAL_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = self._fake_binary(tmp)
+            with mock.patch.dict(os.environ, {"TERMINAL": "foot",
+                                              org.RCLONE_ENV_VAR: str(binary)}):
+                self.assertEqual(org.rclone_config_argv(),
+                                 ["foot", "-e", str(binary), "config"])
+
+    def test_config_argv_falls_back_to_known_terminals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = self._fake_binary(tmp)
+            with mock.patch.dict(os.environ, {"TERMINAL": "",
+                                              org.RCLONE_ENV_VAR: str(binary)}):
+                with mock.patch.object(
+                        org.shutil, "which",
+                        side_effect=lambda n: "/usr/bin/foot" if n == "foot" else None):
+                    self.assertEqual(org.rclone_config_argv(),
+                                     ["/usr/bin/foot", "-e", str(binary), "config"])
+
+    def test_config_argv_is_none_without_rclone(self):
+        with mock.patch.dict(os.environ, {org.RCLONE_ENV_VAR: "/nonexistent"}):
+            self.assertIsNone(org.rclone_config_argv())
+
+
 @unittest.skipUnless(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"),
                      "GUI test needs a display")
 class GoogleDriveGuiTests(unittest.TestCase):
@@ -1301,7 +1408,8 @@ class GoogleDriveGuiTests(unittest.TestCase):
 
         pdir = root_dir / ".file_organizer"
         self._profiles = mock.patch.multiple(
-            org, PROFILES_DIR=pdir, PROFILES_FILE=pdir / "profiles.json")
+            org, PROFILES_DIR=pdir, PROFILES_FILE=pdir / "profiles.json",
+            SETTINGS_FILE=pdir / "settings.json")
         self._profiles.start()
         self.addCleanup(self._profiles.stop)
 
@@ -1405,6 +1513,46 @@ class GoogleDriveGuiTests(unittest.TestCase):
         self.assertEqual(self.app.source_path.get(),
                          "testremote:FileOrganizer/Keep")
 
+    def test_notebook_exposes_three_tabs(self):
+        titles = [self.app.notebook.tab(i, "text").strip()
+                  for i in range(self.app.notebook.index("end"))]
+        self.assertEqual(titles, ["Organize", "Options", "Config"])
+
+    def test_settings_live_in_the_expected_tabs(self):
+        def chain(widget):
+            path = []
+            while widget is not None:
+                path.append(widget)
+                widget = getattr(widget, "master", None)
+            return path
+
+        self.assertIn(self.app.options_tab, chain(self.app.sort_combo))
+        self.assertNotIn(self.app.organize_tab, chain(self.app.sort_combo))
+        self.assertIn(self.app.organize_tab, chain(self.app.log))
+        self.assertIn(self.app.config_tab, chain(self.app.skip_dirs_text))
+        self.assertIn(self.app.config_tab, chain(self.app.drive_list))
+
+    def test_config_tab_lists_configured_remotes(self):
+        items = " ".join(self.app.drive_list.get(0, "end"))
+        self.assertIn("testremote", items)
+        self.assertIn("drive", items)
+
+    def test_saved_scan_rules_apply_to_the_next_scan(self):
+        src = self.root_dir / "srcr"
+        (src / "SkipMe").mkdir(parents=True)
+        (src / "SkipMe" / "a.jpg").write_bytes(b"a")
+        (src / "b.jpg").write_bytes(b"b")
+        self.app.source_path.set(str(src))
+        self.app.skip_dirs_text.delete("1.0", "end")
+        self.app.skip_dirs_text.insert("1.0", "SkipMe")
+        self.app.skip_files_text.delete("1.0", "end")
+        self.app._save_settings_from_ui()
+
+        self.assertEqual(org.load_settings()["skipped_dirs"], ["SkipMe"])
+        self._scan()
+        names = sorted(p.name for p in self.app.scanned_files)
+        self.assertEqual(names, ["b.jpg"])
+
     def test_drive_picker_offers_configured_remotes(self):
         values = [str(v) for v in self.app.dst_drive_combo["values"]]
         self.assertTrue(
@@ -1412,7 +1560,7 @@ class GoogleDriveGuiTests(unittest.TestCase):
         index = next(i for i, v in enumerate(values) if "testremote" in v)
         self.app.dst_drive_combo.current(index)
         self.app._pick_drive("dest")
-        self.assertEqual(self.app.dest_path.get(), "testremote:")
+        self.assertEqual(self.app.dest_path.get(), "testremote:FileOrganizer")
 
     def test_verify_push_reports_missing_files(self):
         src = self.root_dir / "srcv"

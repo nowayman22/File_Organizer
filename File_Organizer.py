@@ -486,6 +486,11 @@ PROFILES_FILE = PROFILES_DIR / "profiles.json"
 # once into the new store rather than silently abandoned after the rename.
 LEGACY_PROFILES_DIR_NAME = ".photo_organizer"
 
+# App-wide settings (scanner skip rules, Drive defaults) live beside the
+# profiles instead of inside them: they are not per-run choices.
+SETTINGS_FILE       = PROFILES_DIR / "settings.json"
+DEFAULT_DRIVE_FOLDER = "FileOrganizer"
+
 # Keys saved/restored when a profile is applied.
 PROFILE_FIELDS = (
     "source_path", "dest_path",
@@ -633,6 +638,42 @@ def save_profiles_to_disk(profiles: dict[str, dict], last_used: Optional[str],
                    "last_locations": last_locations or {}}
         with open(PROFILES_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def load_settings() -> dict:
+    """App-wide settings: scanner skip rules and the Drive default folder."""
+    defaults = {
+        "skipped_dirs": sorted(SKIPPED_DIRS),
+        "skipped_files": sorted(SKIPPED_FILES),
+        "drive_folder": DEFAULT_DRIVE_FOLDER,
+    }
+    try:
+        raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    settings = dict(defaults)
+    for key in ("skipped_dirs", "skipped_files"):
+        values = raw.get(key)
+        if isinstance(values, list):
+            settings[key] = sorted({str(v).strip() for v in values
+                                    if str(v).strip()})
+    folder = raw.get("drive_folder")
+    if isinstance(folder, str):
+        settings["drive_folder"] = folder.strip().strip("/")
+    return settings
+
+
+def save_settings(settings: dict) -> Optional[str]:
+    """Persist app-wide settings. Returns an error string, or None."""
+    try:
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(json.dumps(settings, indent=2) + "\n",
+                                 encoding="utf-8")
         return None
     except OSError as e:
         return str(e)
@@ -901,6 +942,50 @@ def remote_quota(remote: str) -> Optional[dict]:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+TERMINAL_COMMANDS = (
+    ("foot", ["-e"]),
+    ("kitty", []),
+    ("alacritty", ["-e"]),
+    ("ghostty", ["-e"]),
+    ("konsole", ["-e"]),
+    ("xfce4-terminal", ["-x"]),
+    ("gnome-terminal", ["--"]),
+    ("xdg-terminal-exec", []),
+)
+
+
+def rclone_config_dump() -> dict:
+    """Configured remotes as {name: {...}} (empty if rclone is unavailable)."""
+    rc, out, _ = run_rclone(["config", "dump"], timeout=30)
+    if rc != 0:
+        return {}
+    try:
+        data = json.loads(out or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def rclone_config_delete(name: str) -> tuple[bool, str]:
+    rc, _, err = run_rclone(["config", "delete", name], timeout=60)
+    return rc == 0, err.strip()
+
+
+def rclone_config_argv() -> Optional[list[str]]:
+    """argv that opens `rclone config` in a terminal, or None if none exists."""
+    binary = rclone_bin()
+    if binary is None:
+        return None
+    override = os.environ.get("TERMINAL")
+    if override:
+        return [override, "-e", binary, "config"]
+    for name, extra in TERMINAL_COMMANDS:
+        path = shutil.which(name)
+        if path:
+            return [path, *extra, binary, "config"]
+    return None
 
 
 def md5_of(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
@@ -1706,20 +1791,26 @@ SKIPPED_DIRS = {
 SKIPPED_FILES = {"Thumbs.db", "desktop.ini", "ehthumbs.db"}
 
 
-def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
+def walk_files(source: Path, recurse: bool, cancel_event: threading.Event,
+               skip_dirs: Optional[set] = None,
+               skip_files: Optional[set] = None):
     """Yield every ordinary file under `source`.
 
     Skips hidden files/dirs (leading '.'), system junk directories, and
-    rebuildable dependency trees. Resilient against permission errors.
+    rebuildable dependency trees. `skip_dirs`/`skip_files` override the
+    module defaults with the user's saved scan rules. Resilient against
+    permission errors.
     """
+    skip_dirs = SKIPPED_DIRS if skip_dirs is None else set(skip_dirs)
+    skip_files = SKIPPED_FILES if skip_files is None else set(skip_files)
     if recurse:
         for root, dirs, files in os.walk(source, onerror=lambda e: None):
             dirs[:] = [d for d in dirs if not d.startswith(".")
-                       and d not in SKIPPED_DIRS]
+                       and d not in skip_dirs]
             if cancel_event.is_set():
                 return
             for name in files:
-                if name.startswith(".") or name in SKIPPED_FILES:
+                if name.startswith(".") or name in skip_files:
                     continue
                 yield Path(root) / name
     else:
@@ -1728,7 +1819,7 @@ def walk_files(source: Path, recurse: bool, cancel_event: threading.Event):
                 if cancel_event.is_set():
                     return
                 if (p.is_file() and not p.name.startswith(".")
-                        and p.name not in SKIPPED_FILES):
+                        and p.name not in skip_files):
                     yield p
         except (PermissionError, OSError):
             return
@@ -1928,8 +2019,8 @@ class FileOrganizerApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("File Organizer")
-        self.root.geometry("1140x800")
-        self.root.minsize(1020, 720)
+        self.root.geometry("1160x840")
+        self.root.minsize(1040, 720)
 
         self.theme_name = "dark"
         self.colors = THEMES[self.theme_name]
@@ -1979,10 +2070,18 @@ class FileOrganizerApp:
         self.current_profile = tk.StringVar(value=last_used or next(iter(self.profiles)))
         self._suppress_profile_apply = False  # internal flag
 
+        # App-wide settings (scan rules + Drive defaults) --------------- #
+        self.settings = load_settings()
+        self.skip_dirs = set(self.settings["skipped_dirs"])
+        self.skip_files = set(self.settings["skipped_files"])
+        self.drive_folder = self.settings["drive_folder"]
+        self.drive_folder_var = tk.StringVar(value=self.drive_folder)
+
         apply_theme(self.root, self.colors)
         self._build_ui()
         self._apply_theme_to_non_ttk()
         self._configure_log_tags()
+        self._refresh_remotes()
 
         # Apply the initial profile after UI is built
         try:
@@ -2030,43 +2129,40 @@ class FileOrganizerApp:
         ttk.Label(header, text=subtitle, style="Muted.TLabel").pack(
             side=tk.LEFT, padx=(12, 0), pady=(6, 0))
 
-        # Theme + profile cluster on the right
         self.theme_btn = ttk.Button(header, text="☀  Light",
                                     style="Ghost.TButton", command=self._toggle_theme)
         self.theme_btn.pack(side=tk.RIGHT)
 
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16)
 
-        # ---- Profile bar ------------------------------------------- #
-        profbar = ttk.Frame(self.root, padding=(16, 8, 16, 4))
-        profbar.pack(fill=tk.X)
-        ttk.Label(profbar, text="Profile:", style="Heading.TLabel").pack(side=tk.LEFT)
-        self.profile_combo = ttk.Combobox(
-            profbar, textvariable=self.current_profile,
-            values=list(self.profiles.keys()),
-            state="readonly", width=42)
-        self.profile_combo.pack(side=tk.LEFT, padx=(8, 8))
-        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        # ---- Tabs --------------------------------------------------- #
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=16, pady=(8, 12))
 
-        ttk.Button(profbar, text="Save", command=self._save_current_profile)\
-            .pack(side=tk.LEFT)
-        ttk.Button(profbar, text="Save as…", command=self._save_profile_as)\
-            .pack(side=tk.LEFT, padx=(6, 0))
-        self.profile_delete_btn = ttk.Button(profbar, text="Delete",
-                                             command=self._delete_current_profile)
-        self.profile_delete_btn.pack(side=tk.LEFT, padx=(6, 0))
-        self.profile_status = ttk.Label(profbar, text="", style="Muted.TLabel")
-        self.profile_status.pack(side=tk.LEFT, padx=(12, 0))
+        organize = ttk.Frame(self.notebook, padding=(2, 8, 2, 2))
+        options_tab = ttk.Frame(self.notebook, padding=(2, 8, 2, 2))
+        config_tab = ttk.Frame(self.notebook, padding=(2, 8, 2, 2))
+        self.notebook.add(organize, text="   Organize   ")
+        self.notebook.add(options_tab, text="   Options   ")
+        self.notebook.add(config_tab, text="   Config   ")
+        self.organize_tab = organize
+        self.options_tab = options_tab
+        self.config_tab = config_tab
 
-        # ---- Body -------------------------------------------------- #
-        body = ttk.Frame(self.root, padding=(16, 6, 16, 6))
-        body.pack(fill=tk.BOTH, expand=True)
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
+        self._build_organize_tab(organize)
+        self._build_options_tab(options_tab)
+        self._build_config_tab(config_tab)
 
-        # Source + Destination on the same row, side-by-side.
+    # ============================================================== #
+    #  TAB: ORGANIZE                                                 #
+    # ============================================================== #
+    def _build_organize_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(4, weight=1)
+
         # -- Source ------------------------------------------------- #
-        src = ttk.LabelFrame(body, text="  1.  Source  ", style="Card.TLabelframe")
+        src = ttk.LabelFrame(parent, text="  1.  Source  ", style="Card.TLabelframe")
         src.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 8))
 
         src_row = ttk.Frame(src)
@@ -2100,7 +2196,7 @@ class FileOrganizerApp:
                    style="Accent.TButton").pack(side=tk.RIGHT)
 
         # -- Destination -------------------------------------------- #
-        dst = ttk.LabelFrame(body, text="  2.  Destination  ", style="Card.TLabelframe")
+        dst = ttk.LabelFrame(parent, text="  2.  Destination  ", style="Card.TLabelframe")
         dst.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 8))
 
         dst_row = ttk.Frame(dst)
@@ -2134,7 +2230,7 @@ class FileOrganizerApp:
                    command=self._detect_now).pack(side=tk.RIGHT)
 
         # -- File types -------------------------------------------- #
-        types = ttk.LabelFrame(body, text="  3.  File types found  ",
+        types = ttk.LabelFrame(parent, text="  3.  File types found  ",
                                style="Card.TLabelframe")
         types.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
 
@@ -2150,7 +2246,7 @@ class FileOrganizerApp:
 
         canvas_wrap = ttk.Frame(types)
         canvas_wrap.pack(fill=tk.BOTH, expand=True)
-        self.types_canvas = tk.Canvas(canvas_wrap, height=80,
+        self.types_canvas = tk.Canvas(canvas_wrap, height=76,
                                       highlightthickness=0, bd=0)
         yscroll = ttk.Scrollbar(canvas_wrap, orient=tk.VERTICAL,
                                 command=self.types_canvas.yview)
@@ -2166,17 +2262,73 @@ class FileOrganizerApp:
         self.types_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         yscroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # -- Options (compact 2-column grid) ------------------------ #
-        opts = ttk.LabelFrame(body, text="  4.  Options  ", style="Card.TLabelframe")
-        opts.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+        # -- Actions ----------------------------------------------- #
+        actions = ttk.Frame(parent)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.start_btn = ttk.Button(actions, text="▶  Start transfer",
+                                    command=self._start_run, style="Accent.TButton")
+        self.start_btn.pack(side=tk.LEFT)
+        self.cancel_btn = ttk.Button(actions, text="■  Cancel",
+                                     command=self._cancel_run,
+                                     state=tk.DISABLED)
+        self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="🗑  Clear log",
+                   command=self._clear_log,
+                   style="Ghost.TButton").pack(side=tk.RIGHT)
 
-        grid = ttk.Frame(opts)
+        # -- Progress ---------------------------------------------- #
+        prog = ttk.LabelFrame(parent, text="  Progress  ", style="Card.TLabelframe")
+        prog.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.progress = ttk.Progressbar(prog, mode="determinate")
+        self.progress.pack(fill=tk.X, pady=(0, 4))
+        self.progress_label = ttk.Label(prog, text="Ready.", style="Muted.TLabel")
+        self.progress_label.pack(fill=tk.X)
+
+        # -- Log --------------------------------------------------- #
+        log_box = ttk.LabelFrame(parent, text="  Log  ", style="Card.TLabelframe")
+        log_box.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        self.log = scrolledtext.ScrolledText(log_box, height=10, wrap=tk.WORD,
+                                             state=tk.DISABLED, relief="flat",
+                                             bd=0, highlightthickness=0)
+        self.log.pack(fill=tk.BOTH, expand=True)
+
+    # ============================================================== #
+    #  TAB: OPTIONS                                                  #
+    # ============================================================== #
+    def _build_options_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+
+        # -- Profiles ---------------------------------------------- #
+        prof = ttk.LabelFrame(parent, text="  Profiles  ", style="Card.TLabelframe")
+        prof.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        prof_row = ttk.Frame(prof)
+        prof_row.pack(fill=tk.X)
+        ttk.Label(prof_row, text="Profile:", style="Heading.TLabel").pack(side=tk.LEFT)
+        self.profile_combo = ttk.Combobox(
+            prof_row, textvariable=self.current_profile,
+            values=list(self.profiles.keys()),
+            state="readonly", width=42)
+        self.profile_combo.pack(side=tk.LEFT, padx=(8, 8))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+
+        ttk.Button(prof_row, text="Save", command=self._save_current_profile)\
+            .pack(side=tk.LEFT)
+        ttk.Button(prof_row, text="Save as…", command=self._save_profile_as)\
+            .pack(side=tk.LEFT, padx=(6, 0))
+        self.profile_delete_btn = ttk.Button(prof_row, text="Delete",
+                                             command=self._delete_current_profile)
+        self.profile_delete_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.profile_status = ttk.Label(prof, text="", style="Muted.TLabel")
+        self.profile_status.pack(anchor="w", pady=(4, 0))
+
+        # -- Run ---------------------------------------------------- #
+        run = ttk.LabelFrame(parent, text="  Run  ", style="Card.TLabelframe")
+        run.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        grid = ttk.Frame(run)
         grid.pack(fill=tk.X)
-        # Two label/value column pairs
-        grid.columnconfigure(1, weight=1)
         grid.columnconfigure(3, weight=1)
 
-        # Row 0: Mode (left)  |  Operation (right)
+        # Row 0: Mode | Operation
         ttk.Label(grid, text="Mode", style="Heading.TLabel")\
             .grid(row=0, column=0, sticky="w", padx=(0, 8), pady=2)
         mode_row = ttk.Frame(grid)
@@ -2198,7 +2350,7 @@ class FileOrganizerApp:
                                        variable=self.operation, value="move")
         self.move_rb.pack(side=tk.LEFT, padx=(12, 0))
 
-        # Row 1: Sort  (spans both columns of values for the long combobox)
+        # Row 1: Organize into
         ttk.Label(grid, text="Organize into", style="Heading.TLabel")\
             .grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
         self.sort_combo = ttk.Combobox(grid, textvariable=self.sort_mode_label,
@@ -2206,7 +2358,7 @@ class FileOrganizerApp:
                                        state="readonly")
         self.sort_combo.grid(row=1, column=1, columnspan=3, sticky="we", pady=4)
 
-        # Row 2: Duplicates (left) | Verify (right)
+        # Row 2: Duplicates | Double-check
         ttk.Label(grid, text="If duplicate", style="Heading.TLabel")\
             .grid(row=2, column=0, sticky="w", padx=(0, 8), pady=2)
         dup_row = ttk.Frame(grid)
@@ -2227,60 +2379,250 @@ class FileOrganizerApp:
                             variable=self.verify_mode, value=key)\
                 .pack(side=tk.LEFT, padx=(0, 10))
 
-        # Row 3: After-transfer actions
-        ttk.Label(grid, text="After transfer", style="Heading.TLabel")\
-            .grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-        after_row = ttk.Frame(grid)
-        after_row.grid(row=3, column=1, columnspan=3, sticky="w", pady=(6, 2))
+        # -- After transfer ---------------------------------------- #
+        after = ttk.LabelFrame(parent, text="  After transfer  ",
+                               style="Card.TLabelframe")
+        after.grid(row=2, column=0, sticky="ew", pady=(0, 8))
         self.format_check = ttk.Checkbutton(
-            after_row,
+            after,
             text="Format source drive when finished (asks again — erases the whole drive)",
             variable=self.format_source_after)
-        self.format_check.pack(side=tk.LEFT)
+        self.format_check.pack(anchor="w")
 
-        # Row 4: Logging toggles
-        ttk.Label(grid, text="Logging", style="Heading.TLabel")\
-            .grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
-        log_row = ttk.Frame(grid)
-        log_row.grid(row=4, column=1, columnspan=3, sticky="w", pady=(6, 2))
+        # -- Logging ----------------------------------------------- #
+        logging_frame = ttk.LabelFrame(parent, text="  Logging  ",
+                                       style="Card.TLabelframe")
+        logging_frame.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        log_row = ttk.Frame(logging_frame)
+        log_row.pack(fill=tk.X)
         ttk.Checkbutton(log_row, text="Verbose (log every file)",
                         variable=self.verbose_log).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(log_row, text="Save log to file in destination",
-                        variable=self.log_to_file).pack(side=tk.LEFT)
+                        variable=self.log_to_file).pack(side=tk.LEFT, padx=(0, 16))
         ttk.Checkbutton(log_row, text="Sync writes to device (recommended for USB)",
-                        variable=self.sync_writes).pack(side=tk.LEFT, padx=(16, 0))
+                        variable=self.sync_writes).pack(side=tk.LEFT)
 
-        # -- Actions ----------------------------------------------- #
-        actions = ttk.Frame(body)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        self.start_btn = ttk.Button(actions, text="▶  Start transfer",
-                                    command=self._start_run, style="Accent.TButton")
-        self.start_btn.pack(side=tk.LEFT)
-        self.cancel_btn = ttk.Button(actions, text="■  Cancel",
-                                     command=self._cancel_run,
-                                     state=tk.DISABLED)
-        self.cancel_btn.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="🗑  Clear log",
-                   command=self._clear_log,
-                   style="Ghost.TButton").pack(side=tk.RIGHT)
+    # ============================================================== #
+    #  TAB: CONFIG                                                   #
+    # ============================================================== #
+    def _build_config_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
 
-        # -- Progress + Log share remaining vertical space --------- #
-        body.rowconfigure(4, weight=0)
-        body.rowconfigure(5, weight=1)
+        # -- Google Drive ------------------------------------------ #
+        drive = ttk.LabelFrame(parent, text="  Google Drive  ",
+                               style="Card.TLabelframe")
+        drive.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.drive_status = ttk.Label(drive, text="Checking rclone…",
+                                      style="Muted.TLabel", wraplength=700)
+        self.drive_status.pack(anchor="w")
 
-        prog = ttk.LabelFrame(body, text="  Progress  ", style="Card.TLabelframe")
-        prog.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        self.progress = ttk.Progressbar(prog, mode="determinate")
-        self.progress.pack(fill=tk.X, pady=(0, 4))
-        self.progress_label = ttk.Label(prog, text="Ready.", style="Muted.TLabel")
-        self.progress_label.pack(fill=tk.X)
+        list_wrap = ttk.Frame(drive)
+        list_wrap.pack(fill=tk.X, pady=(6, 6))
+        self.drive_list = tk.Listbox(
+            list_wrap, height=4, activestyle="dotbox",
+            bg=self.colors["bg_alt"], fg=self.colors["text"],
+            selectbackground=self.colors["accent"],
+            selectforeground=self.colors["accent_fg"],
+            highlightthickness=1, highlightbackground=self.colors["border"],
+            bd=0)
+        drive_scroll = ttk.Scrollbar(list_wrap, orient="vertical",
+                                     command=self.drive_list.yview)
+        self.drive_list.configure(yscrollcommand=drive_scroll.set)
+        self.drive_list.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        drive_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        log_box = ttk.LabelFrame(body, text="  Log  ", style="Card.TLabelframe")
-        log_box.grid(row=5, column=0, columnspan=2, sticky="nsew")
-        self.log = scrolledtext.ScrolledText(log_box, height=8, wrap=tk.WORD,
-                                             state=tk.DISABLED, relief="flat",
-                                             bd=0, highlightthickness=0)
-        self.log.pack(fill=tk.BOTH, expand=True)
+        drive_buttons = ttk.Frame(drive)
+        drive_buttons.pack(fill=tk.X)
+        ttk.Button(drive_buttons, text="⟳  Refresh",
+                   command=self._refresh_remotes).pack(side=tk.LEFT)
+        ttk.Button(drive_buttons, text="Add / reconfigure…",
+                   command=self._launch_drive_config).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(drive_buttons, text="Test",
+                   command=self._test_remote).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(drive_buttons, text="Remove",
+                   command=self._remove_remote).pack(side=tk.LEFT, padx=(6, 0))
+
+        folder_row = ttk.Frame(drive)
+        folder_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(folder_row, text="Default folder",
+                  style="Heading.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(folder_row, textvariable=self.drive_folder_var,
+                  width=28).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(folder_row, text="e.g. FileOrganizer",
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
+
+        # -- Scan rules -------------------------------------------- #
+        rules = ttk.LabelFrame(parent, text="  Scan rules  ",
+                               style="Card.TLabelframe")
+        rules.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        rules.columnconfigure(0, weight=1)
+        rules.columnconfigure(1, weight=1)
+        rules.rowconfigure(1, weight=1)
+
+        ttk.Label(rules, text="Skip folders (one per line)",
+                  style="Heading.TLabel")\
+            .grid(row=0, column=0, sticky="w", padx=(8, 4), pady=(4, 2))
+        ttk.Label(rules, text="Skip files (one per line)",
+                  style="Heading.TLabel")\
+            .grid(row=0, column=1, sticky="w", padx=(4, 8), pady=(4, 2))
+
+        self.skip_dirs_text = tk.Text(rules, height=7, width=20, wrap=tk.NONE,
+                                      relief="flat", bd=0, highlightthickness=1,
+                                      font=UI_FONT_MONO)
+        self.skip_dirs_text.grid(row=1, column=0, sticky="nsew",
+                                 padx=(8, 4), pady=(0, 6))
+        self.skip_files_text = tk.Text(rules, height=7, width=20, wrap=tk.NONE,
+                                       relief="flat", bd=0, highlightthickness=1,
+                                       font=UI_FONT_MONO)
+        self.skip_files_text.grid(row=1, column=1, sticky="nsew",
+                                  padx=(4, 8), pady=(0, 6))
+
+        footer = ttk.Frame(rules)
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew",
+                    padx=8, pady=(0, 8))
+        ttk.Button(footer, text="Save settings",
+                   command=self._save_settings_from_ui,
+                   style="Accent.TButton").pack(side=tk.LEFT)
+        ttk.Button(footer, text="Reset to defaults",
+                   command=self._reset_settings).pack(side=tk.LEFT, padx=(6, 0))
+        self.config_status = ttk.Label(footer, text="", style="Muted.TLabel",
+                                       wraplength=420)
+        self.config_status.pack(side=tk.LEFT, padx=(12, 0))
+
+        self._fill_settings_widgets()
+
+    # ---------------- Config tab helpers ---------------- #
+    def _fill_settings_widgets(self) -> None:
+        self.skip_dirs_text.delete("1.0", tk.END)
+        self.skip_dirs_text.insert("1.0", "\n".join(sorted(self.skip_dirs)))
+        self.skip_files_text.delete("1.0", tk.END)
+        self.skip_files_text.insert("1.0", "\n".join(sorted(self.skip_files)))
+        self.drive_folder_var.set(self.drive_folder)
+
+    def _refresh_remotes(self) -> None:
+        """Reload the rclone remote list shown in the Config tab."""
+        remotes = rclone_config_dump()
+        names = sorted(remotes)
+        self.drive_list.delete(0, tk.END)
+        for name in names:
+            cfg = remotes.get(name) or {}
+            kind = cfg.get("type", "?") if isinstance(cfg, dict) else "?"
+            self.drive_list.insert(tk.END, f"{name}   ({kind})")
+        binary = rclone_bin()
+        if binary is None:
+            self.drive_status.configure(
+                text="rclone is not installed — install it to use Google Drive.")
+        else:
+            count = len(names)
+            hint = ("" if count else
+                    "   •   use “Add / reconfigure…” to create one")
+            self.drive_status.configure(
+                text=f"rclone: {binary}   •   {count} remote(s) configured{hint}")
+        # Keep the drive pickers in sync without re-listing USB devices.
+        self._update_drives(list(self.usb_drives), names)
+
+    def _selected_remote(self) -> Optional[str]:
+        selection = self.drive_list.curselection()
+        if not selection or selection[0] >= len(self.drive_remotes):
+            return None
+        return self.drive_remotes[selection[0]]
+
+    def _launch_drive_config(self) -> None:
+        """Open `rclone config` in a terminal for browser OAuth."""
+        if rclone_bin() is None:
+            messagebox.showerror(
+                "Google Drive",
+                "rclone is not installed.\n\n"
+                "Install it from https://rclone.org/install/ and reopen this tab.")
+            return
+        argv = rclone_config_argv()
+        if argv is None:
+            messagebox.showerror(
+                "No terminal found",
+                "Could not find a terminal emulator.\n\n"
+                "Run this in a terminal, then press Refresh:\n\n"
+                "    rclone config")
+            return
+        try:
+            subprocess.Popen(argv, start_new_session=True)
+        except OSError as e:
+            messagebox.showerror("Could not start terminal", str(e))
+            return
+        self.config_status.configure(
+            text="Finish the browser login in the terminal, then press Refresh.")
+        self._log_info("Opened `rclone config` in a terminal")
+
+    def _test_remote(self) -> None:
+        name = self._selected_remote()
+        if name is None:
+            messagebox.showinfo("Google Drive", "Select a remote first.")
+            return
+        quota = remote_quota(name)
+        if quota is None:
+            messagebox.showerror(
+                "Connection test",
+                f"Could not read quota for “{name}”.\n\n"
+                f"Check it in a terminal:  rclone about {name}:")
+            return
+        used = int(quota.get("used") or 0)
+        free = int(quota.get("free") or 0)
+        total = int(quota.get("total") or 0)
+        messagebox.showinfo(
+            "Connection test",
+            f"{name}: connected\n\n"
+            f"Used:   {human_size(used)}\n"
+            f"Free:   {human_size(free)}\n"
+            f"Total:  {human_size(total)}")
+
+    def _remove_remote(self) -> None:
+        name = self._selected_remote()
+        if name is None:
+            messagebox.showinfo("Google Drive", "Select a remote first.")
+            return
+        if not messagebox.askyesno(
+                "Remove remote",
+                f"Remove the rclone remote “{name}”?\n\n"
+                f"Only the saved credentials are deleted — files on Drive "
+                f"are untouched."):
+            return
+        ok, err = rclone_config_delete(name)
+        if not ok:
+            messagebox.showerror("Remove failed",
+                                 err or "rclone config delete failed")
+            return
+        self._log_info(f"Removed rclone remote: {name}")
+        self._refresh_remotes()
+
+    def _save_settings_from_ui(self) -> None:
+        skip_dirs = {line.strip() for line in
+                     self.skip_dirs_text.get("1.0", tk.END).splitlines()
+                     if line.strip()}
+        skip_files = {line.strip() for line in
+                      self.skip_files_text.get("1.0", tk.END).splitlines()
+                      if line.strip()}
+        folder = self.drive_folder_var.get().strip().strip("/")
+        self.skip_dirs, self.skip_files = skip_dirs, skip_files
+        self.drive_folder = folder
+        err = save_settings({"skipped_dirs": sorted(skip_dirs),
+                             "skipped_files": sorted(skip_files),
+                             "drive_folder": folder})
+        if err:
+            self.config_status.configure(text=f"Could not save: {err}")
+            self._log_error(f"Settings save failed: {err}")
+            return
+        self.config_status.configure(
+            text=(f"Saved — {len(skip_dirs)} skip folder(s), "
+                  f"{len(skip_files)} skip file(s). Applies to the next scan."))
+        self._log_info("Settings saved")
+
+    def _reset_settings(self) -> None:
+        self.skip_dirs_text.delete("1.0", tk.END)
+        self.skip_dirs_text.insert("1.0", "\n".join(sorted(SKIPPED_DIRS)))
+        self.skip_files_text.delete("1.0", tk.END)
+        self.skip_files_text.insert("1.0", "\n".join(sorted(SKIPPED_FILES)))
+        self.drive_folder_var.set(DEFAULT_DRIVE_FOLDER)
+        self._save_settings_from_ui()
 
     # -------- re-style non-ttk widgets (Text, Canvas) on theme changes --- #
     def _apply_theme_to_non_ttk(self) -> None:
@@ -2291,6 +2633,18 @@ class FileOrganizerApp:
                            selectforeground=c["accent_fg"],
                            font=UI_FONT_MONO)
         self.types_canvas.configure(bg=c["bg"])
+        for widget in (getattr(self, "drive_list", None),
+                       getattr(self, "skip_dirs_text", None),
+                       getattr(self, "skip_files_text", None)):
+            if widget is not None:
+                widget.configure(bg=c["bg_alt"], fg=c["text"],
+                                 highlightbackground=c["border"],
+                                 selectbackground=c["accent"],
+                                 selectforeground=c["accent_fg"])
+        for widget in (getattr(self, "skip_dirs_text", None),
+                       getattr(self, "skip_files_text", None)):
+            if widget is not None:
+                widget.configure(insertbackground=c["text"])
         self.root.configure(bg=c["bg"])
 
     def _configure_log_tags(self) -> None:
@@ -2674,11 +3028,15 @@ class FileOrganizerApp:
             if not (0 <= remote_idx < len(remotes)):
                 return
             remote = remotes[remote_idx]
-            var.set(f"{remote}:")
+            folder = (getattr(self, "drive_folder", "") or "").strip("/")
+            spec = f"{remote}:{folder}" if folder else f"{remote}:"
+            var.set(spec)
             hint.configure(
-                text=f"Drive root — add a folder, e.g. {remote}:FileOrganizer",
+                text=("Drive folder — use Browse… to navigate"
+                      if folder else
+                      "Drive root — set a default folder in the Config tab"),
                 foreground=self.colors["text_muted"])
-            self._log_debug(f"{kind} set from Drive picker: {remote}:")
+            self._log_debug(f"{kind} set from Drive picker: {spec}")
             return
 
         if idx < 0 or idx >= len(self.usb_drives):
@@ -3042,7 +3400,9 @@ class FileOrganizerApp:
                     if len(files) % 500 == 0:
                         self.msg_queue.put(("scan_progress", len(files)))
             else:
-                for p in walk_files(Path(source), recurse, self.cancel_event):
+                for p in walk_files(Path(source), recurse, self.cancel_event,
+                                    skip_dirs=self.skip_dirs,
+                                    skip_files=self.skip_files):
                     files.append(p)
                     ext = p.suffix.lower()
                     counts[ext] += 1
