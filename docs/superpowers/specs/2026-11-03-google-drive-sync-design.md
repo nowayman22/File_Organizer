@@ -50,7 +50,8 @@ remote means ordinary names such as `notes: 2024` are still local paths.
 
 This needs **no new widgets**: the source and destination path entries already exist,
 profiles persist paths as strings, and the drive picker lists remotes alongside USB
-drives. When a field already holds a remote path, its browse button opens a **folder
+drives, and remotes are managed in the **Config** tab (add/test/remove, default
+folder). When a field already holds a remote path, its browse button opens a **folder
 chooser** (double-click to descend, ⬆ to ascend, *Use this folder* to select); folders
 appear on upload, so a not-yet-existing path is selectable and reports that it will be
 created.

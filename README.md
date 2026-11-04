@@ -27,6 +27,8 @@ source drive or folder into a destination, sorted into subfolders by date or fil
   launch; removable paths are matched by drive label plus relative path, so re-plugged
   drives resolve again.
 - **Google Drive push/pull** — optional, through rclone; see the Drive section below.
+- **Tabbed UI** — Organize, Options and Config; scan rules and Drive remotes are editable
+  in the app (saved to `~/.file_organizer/settings.json`).
 - **Profiles** — full settings snapshots, saved to `~/.file_organizer/profiles.json`.
 - **Theming** — dark/light toggle plus live Omarchy theme following over inotify.
 
@@ -42,6 +44,17 @@ source drive or folder into a destination, sorted into subfolders by date or fil
 python3 File_Organizer.py
 ```
 
+## Interface
+
+| Tab | What lives there |
+|---|---|
+| **Organize** | source, destination, USB/Drive pickers, file types, Scan, Start/Cancel, progress and log |
+| **Options** | profiles, run mode, copy/move, sort mode, duplicates, double-check, after-transfer, logging |
+| **Config** | Google Drive remotes and default folder, scanner skip rules (folders/files) |
+
+Settings from the Config tab are global and apply to the next scan; per-run choices stay
+in Options and can be saved as profiles. `~/.file_organizer/settings.json` holds them.
+
 ## Install as a desktop app (Omarchy / Walker)
 
 ```bash
@@ -55,11 +68,16 @@ where it is (or re-run the installer after moving it).
 ## Google Drive (push / pull)
 
 Drive support rides on [rclone](https://rclone.org), so the app stays standard-library
-only and never stores your Google credentials. One-time setup:
+only and never stores your Google credentials. Configure remotes in the **Config** tab —
+*Add / reconfigure…* opens `rclone config` in a terminal for the browser consent — or run
+it yourself once:
 
 ```bash
 rclone config      # n) new remote → Google Drive → name it, e.g. "gdrive"
 ```
+
+The Config tab also tests a remote (quota), removes saved credentials, and sets the
+**default folder** used when you pick a remote from the drive list.
 
 Then use `remote:folder` anywhere a folder is accepted:
 
