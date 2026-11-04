@@ -14,7 +14,7 @@ files, …), not just photos and videos. Rebrand fully to "File Organizer".
 
 - Single-file Tkinter app (`Organizer_Linux.py`, ~3,300 lines), stdlib + optional Pillow.
 - Copies/moves files from a source drive/folder to a destination, sorted into subfolders
-  by date or file type (8 sort modes).
+  by date or file type (9 sort modes).
 - USB drive detection + mount/unmount (udisksctl), duplicate handling (rename/overwrite/
   skip/erase), verify modes (off/quick/SHA-256), profiles, color-coded logging, live
   throughput stats, dark/light themes with Omarchy follow.
@@ -41,6 +41,10 @@ files, …), not just photos and videos. Rebrand fully to "File Organizer".
     `.DS_Store`, `.thumbnails`, `.gitignore`; and
   - system junk directories: `System Volume Information`, `$RECYCLE.BIN`, `__MACOSX`,
     `.Spotlight-V100`, `.Trashes`, `lost+found`.
+  - rebuildable dependency/cache trees that a general-purpose organizer must not sweep
+    into the destination: `node_modules`, `venv`, `__pycache__`, `site-packages`; and
+  - OS metadata files: `Thumbs.db`, `desktop.ini`, `ehthumbs.db`.
+    (Both added after implementation — see the plan's *Post-implementation corrections*.)
 - Add a hidden-*file* skip (today only directories are filtered).
 - Remove the now-unused `MEDIA_EXTENSIONS` constant. Keep `IMAGE_EXTENSIONS`,
   `VIDEO_EXTENSIONS`, `MP4_LIKE_EXTENSIONS` — they still power EXIF + MP4-family
@@ -68,7 +72,11 @@ files, …), not just photos and videos. Rebrand fully to "File Organizer".
 - `PhotoOrganizerApp` → `FileOrganizerApp`.
 - Window title → `File Organizer`; header label `📷 Photo Organizer` → `🗂 File Organizer`;
   session-log header → `File Organizer`.
-- `PROFILES_DIR` → `~/.file_organizer` (profile JSON lives there).
+- `PROFILES_DIR` → `~/.file_organizer` (profile JSON lives there), **with a one-time
+  migration** from `~/.photo_organizer/profiles.json` on first launch: custom profiles
+  *and* the remembered source/destination locations are copied over, an existing new
+  store is never overwritten, and the legacy file is kept. (Added after implementation;
+  the original spec omitted it, which would have silently dropped user state.)
 - Script renamed `Organizer_Linux.py` → `File_Organizer.py`.
 - Tests: `import Organizer_Linux as org` → `import File_Organizer as org`; test module
   docstring updated; persistence-test fixture path `.photo_organizer` → `.file_organizer`.

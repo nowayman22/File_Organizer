@@ -579,3 +579,46 @@ Expected: nothing to commit (clean). If Task 6's grep in Step 2 rewrote any file
 - **Spec coverage:** §1 copy → already done (commit `6aadda6`). §2 scanner → Task 1. §3 mtime fallback → Task 3. §4 type folders → Task 2. §5 UI copy → Tasks 1 & 4. §6 rebrand → Tasks 4 & 5. §7 tests/verification → Tasks 1-3, 6.
 - **No placeholders:** every code step shows exact before/after text; every command shows expected output.
 - **Type consistency:** `walk_files(source, recurse, cancel_event)` name/signature used consistently in Task 1's test, implementation, and caller. `KNOWN_TYPE_FOLDERS` referenced only in `detect_folder_structure`. `FileOrganizerApp` referenced in `main()` alongside its class def in Task 4.
+
+---
+
+## Post-implementation corrections
+
+Recorded on branch `fix/pre-feature-cleanup` after Tasks 1-6 shipped. The steps above are
+left as written (they are the historical record); these are the places where reality
+differed.
+
+1. **Task 6, Step 2 expected output was wrong.** The suggested grep reports *no* matches,
+   but run over the repo it finds ~120 matches in `docs/` — including this plan and the
+   2026-08-10 design spec themselves — plus deliberate code references. What actually
+   holds is that no *obsolete identifier* survives:
+
+   ```bash
+   grep -rn "Organizer_Linux\|walk_media\|MEDIA_EXTENSIONS\|PhotoOrganizer" File_Organizer.py tests/test_organizer.py
+   # -> no matches (exit 1)
+   ```
+
+   The remaining "Photo Organizer" / `.photo_organizer` mentions are intentional: the
+   legacy-store migration added in correction 4, and
+   `test_removes_stale_photo_organizer_entry`, which asserts that `install.sh` deletes the
+   stale `photo-organizer.desktop` launcher.
+
+2. **Task 4 missed a docstring line.** The module docstring's profile note
+   (`to ~/.photo_organizer/profiles.json`) is not in any Task 4 step. It was corrected to
+   `~/.file_organizer` during implementation.
+
+3. **Task 1's banner edit left the comment misaligned.** Only the text of the fixed-width
+   `#  Media extensions … #` rule was replaced, so the trailing `#` no longer lined up;
+   the line was re-padded during implementation.
+
+4. **The `PROFILES_DIR` move silently dropped user state** (not addressed by any task).
+   `profiles.json` also stores the remembered source/destination locations, so the rename
+   abandoned both. Fixed by a one-time migration: `migrate_legacy_profiles()` copies
+   `~/.photo_organizer/profiles.json` into the new store when — and only when — the new
+   store does not exist yet; it validates the JSON first, never overwrites, and never
+   deletes the legacy file. Covered by `LegacyProfileMigrationTests`.
+
+5. **"Every ordinary file" had no dependency-tree filter.** A general-purpose organizer
+   would otherwise copy `node_modules/`, `venv/`, and `__pycache__/` wholesale, plus
+   `Thumbs.db` / `desktop.ini`. `SKIPPED_DIRS` and `SKIPPED_FILES` now exclude them; see
+   `test_skips_dependency_trees` and `test_skips_os_metadata_files`.
