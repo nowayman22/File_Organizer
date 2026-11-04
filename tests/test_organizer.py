@@ -1,7 +1,8 @@
 """Unit tests for the pure helper functions in File_Organizer.py.
 
 Run from the project root:  python -m unittest tests.test_organizer -v
-These tests never create Tk widgets, so they run headless.
+Everything runs headless except GoogleDriveGuiTests, which is skipped when no
+display is available; it drives the real Tk app against a fake rclone binary.
 """
 import json
 import os
@@ -13,6 +14,7 @@ import xml.etree.ElementTree as ET
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -947,6 +949,528 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(desktop.read_text(), first)
             self.assertTrue(desktop.is_file())
             self.assertTrue(icon.is_file())
+
+
+# A stand-in for the real rclone binary. It implements just the subcommands the
+# app uses, backed by a directory, so Drive paths, hashes and transfers can be
+# tested end-to-end without network access or credentials.
+FAKE_RCLONE_SOURCE = r'''#!/usr/bin/env python3
+import hashlib, json, os, shutil, sys, time
+from datetime import datetime, timezone
+from pathlib import Path
+
+REMOTE = "testremote"
+ROOT = Path(os.environ.get("STUB_ROOT", "."))
+
+
+def md5_of(p):
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def record(p, base):
+    st = p.stat()
+    return {"Path": p.relative_to(base).as_posix(), "Name": p.name,
+            "Size": st.st_size, "IsDir": False,
+            "ModTime": datetime.fromtimestamp(st.st_mtime, timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "Hashes": {"md5": md5_of(p)}}
+
+
+def to_local(spec):
+    name, _, rest = spec.partition(":")
+    if name != REMOTE:
+        sys.stderr.write("unknown remote %s\n" % name)
+        sys.exit(2)
+    return ROOT / rest.strip("/")
+
+
+def is_spec(text):
+    return text.partition(":")[0] == REMOTE
+
+
+args = sys.argv[1:]
+cmd = args[0] if args else ""
+rest = args[1:]
+flags = [a for a in rest if a.startswith("-")]
+pos = [a for a in rest if not a.startswith("-")]
+
+if cmd == "listremotes":
+    print(REMOTE + ":")
+elif cmd == "lsjson":
+    target = to_local(pos[0])
+    if "--stat" in flags:
+        if not target.is_file():
+            sys.stderr.write("object not found\n")
+            sys.exit(3)
+        print(json.dumps(record(target, target.parent)))
+    else:
+        if not target.is_dir():
+            print("[]")
+            sys.exit(0)
+        items = list(target.rglob("*")) if "-R" in flags else list(target.iterdir())
+        print(json.dumps([record(p, target) for p in sorted(items) if p.is_file()]))
+elif cmd == "copyto":
+    src, dst = pos[0], pos[1]
+    if os.environ.get("STUB_SLEEP"):
+        time.sleep(float(os.environ["STUB_SLEEP"]))
+    if is_spec(src):
+        src_path, dst_path = to_local(src), Path(dst)
+    else:
+        src_path, dst_path = Path(src), to_local(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src_path, dst_path)
+elif cmd == "deletefile":
+    to_local(pos[0]).unlink()
+elif cmd == "about":
+    print(json.dumps({"total": 1000, "used": 250, "free": 750, "trashed": 0}))
+else:
+    sys.stderr.write("unsupported: %s\n" % cmd)
+    sys.exit(2)
+'''
+
+
+class RcloneBackendTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.root = root
+        self.remote_root = root / "remote"
+        self.remote_root.mkdir()
+        binary = root / "bin" / "rclone"
+        binary.parent.mkdir()
+        binary.write_text(FAKE_RCLONE_SOURCE)
+        binary.chmod(0o755)
+        self.bin = binary
+        self._env = mock.patch.dict(os.environ, {
+            org.RCLONE_ENV_VAR: str(binary),
+            "STUB_ROOT": str(self.remote_root),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def put_remote(self, rel, content):
+        p = self.remote_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
+
+    def local_file(self, name="a.txt", content=b"hello"):
+        p = self.root / "local" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        return p
+
+    def test_list_remotes(self):
+        self.assertEqual(org.list_remotes(), ["testremote"])
+
+    def test_split_and_join(self):
+        self.assertEqual(org.split_remote_spec("gdrive:Photos/2024"),
+                         ("gdrive", "Photos/2024"))
+        self.assertIsNone(org.split_remote_spec("/home/user/photos"))
+        self.assertEqual(org.join_remote("testremote:Photos", "2024", "a.jpg"),
+                         "testremote:Photos/2024/a.jpg")
+        self.assertEqual(org.join_remote("testremote:"), "testremote:")
+
+    def test_join_rejects_traversal(self):
+        with self.assertRaises(ValueError):
+            org.join_remote("testremote:Photos", "..", "etc")
+        with self.assertRaises(ValueError):
+            org.join_remote("not-a-spec")
+
+    def test_is_remote_path_requires_configured_remote(self):
+        self.assertTrue(org.is_remote_path("testremote:Photos"))
+        self.assertFalse(org.is_remote_path("elsewhere:Photos"))
+        self.assertFalse(org.is_remote_path("/home/user/Photos"))
+        self.assertFalse(org.is_remote_path("notes: 2024"))
+
+    def test_scan_remote_recursive(self):
+        self.put_remote("Photos/2024/a.jpg", b"aaa")
+        self.put_remote("Photos/2024/sub/b.jpg", b"bbbb")
+        entries = org.scan_remote("testremote:Photos")
+        self.assertEqual(sorted(e.name for e in entries), ["a.jpg", "b.jpg"])
+        self.assertEqual({e.name: e.size for e in entries},
+                         {"a.jpg": 3, "b.jpg": 4})
+        self.assertTrue(all(e.md5 for e in entries))
+        self.assertTrue(all(e.modtime is not None for e in entries))
+
+    def test_scan_remote_flat_lists_direct_children(self):
+        self.put_remote("Photos/top.jpg", b"x")
+        self.put_remote("Photos/sub/deep.jpg", b"yy")
+        entries = org.scan_remote("testremote:Photos", recursive=False)
+        self.assertEqual([e.name for e in entries], ["top.jpg"])
+
+    def test_remote_stat_present_and_absent(self):
+        self.put_remote("Photos/a.jpg", b"abc")
+        entry = org.remote_stat("testremote:Photos/a.jpg")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.size, 3)
+        self.assertIsNone(org.remote_stat("testremote:Photos/missing.jpg"))
+
+    def test_upload_then_verify(self):
+        local = self.local_file(content=b"payload-123")
+        spec = "testremote:Photos/2024/a.txt"
+        ok, err = org.upload_file(local, spec)
+        self.assertTrue(ok, err)
+        self.assertTrue((self.remote_root / "Photos/2024/a.txt").is_file())
+        self.assertEqual(org.remote_verify(local, spec, "quick"), (True, ""))
+        self.assertEqual(org.remote_verify(local, spec, "hash"), (True, ""))
+        self.assertEqual(org.remote_verify(local, spec, "off"), (True, ""))
+
+    def test_verify_detects_size_then_hash_mismatch(self):
+        local = self.local_file(content=b"abcdef")
+        spec = "testremote:Photos/a.txt"
+        ok, err = org.upload_file(local, spec)
+        self.assertTrue(ok, err)
+
+        # same length, different bytes -> size passes, MD5 must fail
+        self.put_remote("Photos/a.txt", b"ABCDEF")
+        ok_quick, _ = org.remote_verify(local, spec, "quick")
+        ok_hash, why = org.remote_verify(local, spec, "hash")
+        self.assertTrue(ok_quick)
+        self.assertFalse(ok_hash)
+        self.assertIn("MD5", why)
+
+        # different length -> even quick fails
+        self.put_remote("Photos/a.txt", b"short")
+        ok_quick, why = org.remote_verify(local, spec, "quick")
+        self.assertFalse(ok_quick)
+        self.assertIn("size", why)
+
+    def test_missing_remote_file_fails_verify(self):
+        local = self.local_file()
+        self.assertEqual(org.remote_verify(local, "testremote:nope.txt", "quick"),
+                         (False, "not found on remote"))
+
+    def test_download_and_delete(self):
+        self.put_remote("Photos/b.bin", b"binary-bytes")
+        target = self.root / "out" / "b.bin"
+        ok, err = org.download_file("testremote:Photos/b.bin", target)
+        self.assertTrue(ok, err)
+        self.assertEqual(target.read_bytes(), b"binary-bytes")
+        ok, err = org.delete_remote_file("testremote:Photos/b.bin")
+        self.assertTrue(ok, err)
+        self.assertFalse((self.remote_root / "Photos/b.bin").exists())
+
+    def test_remote_quota(self):
+        quota = org.remote_quota("testremote")
+        self.assertEqual(quota["free"], 750)
+        self.assertEqual(quota["total"], 1000)
+
+    def test_cancel_terminates_a_running_transfer(self):
+        local = self.local_file(content=b"x" * 1024)
+        cancel = threading.Event()
+        cancel.set()
+        started = time.time()
+        with mock.patch.dict(os.environ, {"STUB_SLEEP": "10"}):
+            ok, err = org.upload_file(local, "testremote:Photos/slow.bin",
+                                      cancel_event=cancel)
+        self.assertFalse(ok)
+        self.assertIn("cancelled", err)
+        self.assertLess(time.time() - started, 5.0, "cancel must not wait for rclone")
+        self.assertFalse((self.remote_root / "Photos/slow.bin").exists())
+
+    def test_missing_rclone_is_graceful(self):
+        with mock.patch.dict(os.environ,
+                             {org.RCLONE_ENV_VAR: "/nonexistent/rclone"}):
+            self.assertIsNone(org.rclone_bin())
+            self.assertEqual(org.list_remotes(), [])
+            self.assertFalse(org.is_remote_path("testremote:Photos"))
+            ok, err = org.upload_file(self.local_file(), "testremote:x")
+            self.assertFalse(ok)
+            self.assertIn("rclone", err)
+            self.assertIsNone(org.remote_quota("testremote"))
+
+class RemotePathTests(unittest.TestCase):
+    """Target/sort helpers shared by the local and Drive workers."""
+
+    def test_subfolder_for_date_matches_local_sorting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "a.jpg"
+            f.write_bytes(b"x")
+            stamp = datetime(2024, 1, 24, 9, 0).timestamp()
+            os.utime(f, (stamp, stamp))
+            when = datetime.fromtimestamp(stamp)
+            for kind, _label in org.SORT_MODES:
+                if kind in ("none", "file_type"):
+                    continue
+                self.assertEqual(
+                    org.build_target_subfolder(f, ".jpg", kind),
+                    org.subfolder_for_date(when, ".jpg", kind), kind)
+
+    def test_type_folder_needs_no_date_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "not-there.pdf"
+            self.assertEqual(
+                org.build_target_subfolder(missing, ".pdf", "file_type"), Path("PDF"))
+            self.assertEqual(
+                org.build_target_subfolder(missing, "", "file_type"), Path("OTHER"))
+
+    def test_pull_target_sorts_by_remote_modtime(self):
+        entry = org.RemoteEntry("gdrive:Photos/a.jpg", 3,
+                                datetime(2024, 1, 15, 10, 30))
+        self.assertEqual(org.pull_target(Path("/dest"), entry, "year_month"),
+                         Path("/dest/2024/01-January/a.jpg"))
+        self.assertEqual(org.pull_target(Path("/dest"), entry, "year"),
+                         Path("/dest/2024/a.jpg"))
+        self.assertEqual(org.pull_target(Path("/dest"), entry, "file_type"),
+                         Path("/dest/JPG/a.jpg"))
+
+    def test_pull_target_without_modtime_uses_today(self):
+        entry = org.RemoteEntry("gdrive:a.jpg", 1, None)
+        target = org.pull_target(Path("/dest"), entry, "year")
+        self.assertEqual(target,
+                         Path("/dest") / str(datetime.now().year) / "a.jpg")
+
+    def test_remote_target(self):
+        self.assertEqual(
+            org.remote_target("gdrive:FileOrganizer", Path("2024/01-January"),
+                              "a.jpg"),
+            "gdrive:FileOrganizer/2024/01-January/a.jpg")
+        self.assertEqual(
+            org.remote_target("gdrive:FileOrganizer", Path("."), "a.jpg"),
+            "gdrive:FileOrganizer/a.jpg")
+
+    def test_remote_rename_target_probes_until_free(self):
+        taken = {"gdrive:P/a_2.jpg", "gdrive:P/a_3.jpg"}
+        self.assertEqual(
+            org.remote_rename_target("gdrive:P/a.jpg",
+                                     probe=lambda s: s in taken),
+            "gdrive:P/a_4.jpg")
+        self.assertIsNone(
+            org.remote_rename_target("gdrive:P/a.jpg",
+                                     probe=lambda s: True, limit=3))
+
+    def test_split_remote_name(self):
+        self.assertEqual(org.split_remote_name("gdrive:P/a.jpg"),
+                         ("gdrive:P/a", ".jpg"))
+        self.assertEqual(org.split_remote_name("gdrive:a.tar.gz"),
+                         ("gdrive:a.tar", ".gz"))
+
+
+@unittest.skipUnless(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"),
+                     "GUI test needs a display")
+class GoogleDriveGuiTests(unittest.TestCase):
+    """Push/Pull through the real Tk app against the fake rclone binary."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root_dir = Path(self._tmp.name)
+        self.root_dir = root_dir
+        self.remote_root = root_dir / "remote"
+        self.remote_root.mkdir()
+        binary = root_dir / "bin" / "rclone"
+        binary.parent.mkdir()
+        binary.write_text(FAKE_RCLONE_SOURCE)
+        binary.chmod(0o755)
+        self._env = mock.patch.dict(os.environ, {
+            org.RCLONE_ENV_VAR: str(binary),
+            "STUB_ROOT": str(self.remote_root),
+        })
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+        pdir = root_dir / ".file_organizer"
+        self._profiles = mock.patch.multiple(
+            org, PROFILES_DIR=pdir, PROFILES_FILE=pdir / "profiles.json")
+        self._profiles.start()
+        self.addCleanup(self._profiles.stop)
+
+        self.dialogs = {}
+        for name, value in (("askyesno", True), ("showinfo", None),
+                            ("showwarning", None), ("showerror", None)):
+            patcher = mock.patch.object(org.messagebox, name, return_value=value)
+            self.dialogs[name] = patcher.start()
+            self.addCleanup(patcher.stop)
+
+        self.tk_root = org.tk.Tk()
+        self.tk_root.withdraw()
+        self.app = org.FileOrganizerApp(self.tk_root)
+        self.app.sort_mode_label.set(org.SORT_LABEL_BY_KEY["year_month"])
+        self.app.include_subdirs.set(True)
+        self.app.verbose_log.set(False)
+        self.app.log_to_file.set(False)
+        self.app.verify_mode.set("quick")
+
+    def tearDown(self):
+        # Cancel the app's periodic after() callbacks before tearing the
+        # interpreter down, otherwise Tcl complains about dead commands.
+        try:
+            for job in self.tk_root.tk.call("after", "info"):
+                try:
+                    self.tk_root.after_cancel(job)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.tk_root.destroy()
+        except Exception:
+            pass
+
+    def _wait(self, timeout: float = 30.0) -> None:
+        """Run the real Tk loop until the worker thread finishes.
+
+        The app's workers read Tk variables, which requires an active
+        mainloop exactly like running the application for real.
+        """
+        root = self.tk_root
+        state = {"dead_at": None}
+        deadline = time.time() + timeout
+
+        def check():
+            alive = self.app.worker is not None and self.app.worker.is_alive()
+            if alive:
+                state["dead_at"] = None
+            elif state["dead_at"] is None:
+                state["dead_at"] = time.time()
+            if state["dead_at"] and time.time() - state["dead_at"] > 0.3:
+                root.quit()
+                return
+            if time.time() > deadline:
+                root.quit()
+                return
+            root.after(30, check)
+
+        root.after(30, check)
+        root.mainloop()
+        self.app._poll_queue()      # drain messages left behind by the worker
+
+    def _scan(self) -> None:
+        self.tk_root.after(10, self.app._start_scan)
+        self._wait()
+        self.assertTrue(self.app.scanned_files, "scan produced no files")
+
+    def _run(self) -> None:
+        self.tk_root.after(10, self.app._start_run)
+        self._wait()
+
+    def _local_source(self, name: str = "src") -> Path:
+        src = self.root_dir / name
+        src.mkdir()
+        f = src / "report.pdf"
+        f.write_bytes(b"pdf-bytes")
+        stamp = datetime(2024, 1, 15, 12, 0).timestamp()
+        os.utime(f, (stamp, stamp))
+        return src
+
+    def test_drive_picker_offers_configured_remotes(self):
+        values = [str(v) for v in self.app.dst_drive_combo["values"]]
+        self.assertTrue(
+            any("testremote" in v and "Google Drive" in v for v in values), values)
+        index = next(i for i, v in enumerate(values) if "testremote" in v)
+        self.app.dst_drive_combo.current(index)
+        self.app._pick_drive("dest")
+        self.assertEqual(self.app.dest_path.get(), "testremote:")
+
+    def test_verify_push_reports_missing_files(self):
+        src = self.root_dir / "srcv"
+        src.mkdir()
+        stamp = datetime(2024, 1, 15, 12, 0).timestamp()
+        for name, payload in (("present.pdf", b"p"), ("missing.pdf", b"m")):
+            f = src / name
+            f.write_bytes(payload)
+            os.utime(f, (stamp, stamp))
+        remote = self.remote_root / "V" / "2024" / "01-January"
+        remote.mkdir(parents=True)
+        (remote / "present.pdf").write_bytes(b"p")
+
+        self.app.source_path.set(str(src))
+        self.app.dest_path.set("testremote:V")
+        self.app.run_mode.set("verify")
+        self._scan()
+        self._run()
+
+        infos = " ".join(str(c.args) for c in self.dialogs["showinfo"].call_args_list)
+        self.assertIn("missing", infos.lower())
+        self.assertTrue((src / "missing.pdf").exists(), "verify is read-only")
+
+    def test_verify_pull_reports_missing_files(self):
+        remote = self.remote_root / "R" / "2024" / "01-January"
+        remote.mkdir(parents=True)
+        stamp = datetime(2024, 1, 15, 12, 0).timestamp()
+        for name, payload in (("here.jpg", b"a"), ("gone.jpg", b"b")):
+            f = remote / name
+            f.write_bytes(payload)
+            os.utime(f, (stamp, stamp))
+
+        dest = self.root_dir / "destv"
+        local = dest / "2024" / "01-January"
+        local.mkdir(parents=True)
+        (local / "here.jpg").write_bytes(b"a")
+
+        self.app.source_path.set("testremote:R")
+        self.app.dest_path.set(str(dest))
+        self.app.run_mode.set("verify")
+        self._scan()
+        self._run()
+
+        infos = " ".join(str(c.args) for c in self.dialogs["showinfo"].call_args_list)
+        self.assertIn("missing", infos.lower())
+        self.assertFalse((local / "gone.jpg").exists(), "verify must not download")
+
+    def test_push_copies_sorted_file_to_drive(self):
+        src = self._local_source()
+        self.app.source_path.set(str(src))
+        self.app.dest_path.set("testremote:FileOrganizer")
+        self.app.run_mode.set("transfer")
+        self.app.operation.set("copy")
+        self.app.dup_mode.set("rename")
+        self._scan()
+        self._run()
+
+        remote = (self.remote_root / "FileOrganizer" / "2024"
+                  / "01-January" / "report.pdf")
+        self.assertTrue(remote.is_file(),
+                        sorted(p.as_posix() for p in self.remote_root.rglob("*")))
+        self.assertEqual(remote.read_bytes(), b"pdf-bytes")
+        self.assertTrue((src / "report.pdf").is_file(), "copy must keep the source")
+
+    def test_pull_downloads_into_sorted_folders(self):
+        remote_dir = self.remote_root / "FileOrganizer" / "2024" / "01-January"
+        remote_dir.mkdir(parents=True)
+        stamp = datetime(2024, 1, 15, 12, 0).timestamp()
+        for name, payload in (("a.jpg", b"jpg"), ("notes.txt", b"txt")):
+            p = remote_dir / name
+            p.write_bytes(payload)
+            os.utime(p, (stamp, stamp))
+
+        dest = self.root_dir / "dest"
+        self.app.source_path.set("testremote:FileOrganizer")
+        self.app.dest_path.set(str(dest))
+        self.app.run_mode.set("transfer")
+        self.app.operation.set("copy")
+        self.app.dup_mode.set("rename")
+        self._scan()
+        self.assertIsInstance(self.app.scanned_files[0], org.RemoteEntry)
+        self._run()
+
+        expected = dest / "2024" / "01-January"
+        self.assertEqual(sorted(p.name for p in expected.iterdir()),
+                         ["a.jpg", "notes.txt"])
+        self.assertEqual((expected / "a.jpg").read_bytes(), b"jpg")
+        self.assertTrue((remote_dir / "a.jpg").is_file(), "copy must keep the remote")
+
+    def test_push_move_deletes_source_after_verification(self):
+        src = self._local_source("src2")
+        self.app.source_path.set(str(src))
+        self.app.dest_path.set("testremote:Verified")
+        self.app.run_mode.set("transfer_verify")
+        self.app.operation.set("move")
+        self.app.dup_mode.set("rename")
+        self._scan()
+        self._run()
+
+        remote = (self.remote_root / "Verified" / "2024"
+                  / "01-January" / "report.pdf")
+        self.assertTrue(remote.is_file())
+        self.assertFalse((src / "report.pdf").exists(),
+                         "move should delete the source after a passing verify")
 
 
 if __name__ == "__main__":

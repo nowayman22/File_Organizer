@@ -26,6 +26,7 @@ source drive or folder into a destination, sorted into subfolders by date or fil
 - **Remembers where things were** — the source/destination pair is restored on the next
   launch; removable paths are matched by drive label plus relative path, so re-plugged
   drives resolve again.
+- **Google Drive push/pull** — optional, through rclone; see the Drive section below.
 - **Profiles** — full settings snapshots, saved to `~/.file_organizer/profiles.json`.
 - **Theming** — dark/light toggle plus live Omarchy theme following over inotify.
 
@@ -51,15 +52,49 @@ packaging/install.sh --uninstall  # remove them
 The generated `.desktop` entry runs the script from this checkout, so keep the repo
 where it is (or re-run the installer after moving it).
 
+## Google Drive (push / pull)
+
+Drive support rides on [rclone](https://rclone.org), so the app stays standard-library
+only and never stores your Google credentials. One-time setup:
+
+```bash
+rclone config      # n) new remote → Google Drive → name it, e.g. "gdrive"
+```
+
+Then use `remote:folder` anywhere a folder is accepted:
+
+| Direction | Source | Destination |
+|---|---|---|
+| **Push** (upload, sorted) | local folder / USB drive | `gdrive:FileOrganizer` |
+| **Pull** (download, sorted) | `gdrive:FileOrganizer` | local folder |
+
+`Copy` keeps the other side; `Move` deletes the source only after its copy passes the
+check. Duplicate handling and double-check modes apply exactly as they do locally:
+
+- **Double-check** — `Off`; `Quick` = size; `SHA-256` becomes **size + MD5** for Drive
+  (Google Docs/Sheets expose no binary hash, so they verify by size).
+- **Duplicates** — `Rename`, `Overwrite`, `Skip`, and `Erase source` (deletes a local
+  file only when the Drive copy is identical; same-name/different-content pairs are
+  kept).
+
+Configured remotes also appear at the bottom of the drive dropdowns, marked ☁, so you
+can pick one instead of typing. Drive → Drive is rejected; keep one side local.
+
+Notes: files transfer one at a time (simple progress and cancellation), Cancel
+terminates the running `rclone`, and `FILE_ORGANIZER_RCLONE=/path/to/rclone` overrides
+the binary if it is not on `PATH`.
+
 ## Tests
 
 ```bash
 python3 -m unittest tests.test_organizer -v
 ```
 
-The suite is headless — it creates no Tk widgets — and covers drive parsing, mount/
-unmount diagnosis, duplicate detection, colour math, the theme watcher, persistence,
-the all-file scanner, legacy profile migration, packaging assets, and the installer.
+Everything runs headless except the three Drive GUI tests, which drive the real Tk app
+against a fake `rclone` and are skipped when no display is available. Coverage includes
+drive parsing, mount/unmount diagnosis, duplicate detection, colour math, the theme
+watcher, persistence, the all-file scanner, legacy profile migration, the rclone
+transport (paths, hashes, transfers, cancellation), packaging assets, and the installer.
 
 ## What the scanner skips
 
