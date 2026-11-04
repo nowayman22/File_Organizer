@@ -78,7 +78,9 @@ check. Duplicate handling and double-check modes apply exactly as they do locall
   kept).
 
 Configured remotes also appear at the bottom of the drive dropdowns, marked ☁, so you
-can pick one instead of typing. Drive → Drive is rejected; keep one side local.
+can pick one instead of typing; once a field holds a Drive path, its folder button opens
+a chooser (double-click a folder to open it, ⬆ goes up a level, **Use this folder**
+selects it). Drive → Drive is rejected; keep one side local.
 
 Notes: files transfer one at a time (simple progress and cancellation), Cancel
 terminates the running `rclone`, and `FILE_ORGANIZER_RCLONE=/path/to/rclone` overrides
