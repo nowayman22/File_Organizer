@@ -663,7 +663,8 @@ class RemoteEntry(NamedTuple):
 
     @property
     def name(self) -> str:
-        return self.path.rsplit("/", 1)[-1]
+        _, _, path = self.path.partition(":")
+        return path.rsplit("/", 1)[-1] or self.path
 
     @property
     def suffix(self) -> str:
@@ -681,17 +682,39 @@ def rclone_bin() -> Optional[str]:
     return shutil.which("rclone")
 
 
-def run_rclone(args: list[str], timeout: int = 120) -> tuple[int, str, str]:
-    """Run rclone non-interactively. Returns (returncode, stdout, stderr)."""
+def run_rclone(args: list[str], timeout: int = 120,
+               cancel_event: Optional[threading.Event] = None) -> tuple[int, str, str]:
+    """Run rclone non-interactively. Returns (returncode, stdout, stderr).
+
+    When `cancel_event` is set the child is terminated, so a cancelled run does
+    not have to wait for a large upload to finish.
+    """
     binary = rclone_bin()
     if binary is None:
         return 127, "", "rclone is not installed"
     try:
-        proc = subprocess.run([binary, *args], capture_output=True, text=True,
-                              timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as e:
+        proc = subprocess.Popen([binary, *args], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    except OSError as e:
         return 1, "", str(e)
-    return proc.returncode, proc.stdout, proc.stderr
+    deadline = time.time() + timeout
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.25)
+            return proc.returncode, out or "", err or ""
+        except subprocess.TimeoutExpired:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            expired = time.time() > deadline
+            if not (cancelled or expired):
+                continue
+            try:
+                proc.terminate()
+                out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+            reason = "[cancelled]" if cancelled else "[timeout]"
+            return 1, out or "", f"{(err or '').strip()}\n{reason}".strip()
 
 
 def list_remotes() -> list[str]:
@@ -811,19 +834,21 @@ def remote_stat(spec: str) -> Optional[RemoteEntry]:
                        md5 if isinstance(md5, str) else None)
 
 
-def upload_file(local: Path, spec: str) -> tuple[bool, str]:
+def upload_file(local: Path, spec: str,
+                cancel_event: Optional[threading.Event] = None) -> tuple[bool, str]:
     rc, _, err = run_rclone(["copyto", str(local), spec, "--no-traverse"],
-                            timeout=3600)
+                            timeout=3600, cancel_event=cancel_event)
     return rc == 0, err.strip()
 
 
-def download_file(spec: str, local: Path) -> tuple[bool, str]:
+def download_file(spec: str, local: Path,
+                  cancel_event: Optional[threading.Event] = None) -> tuple[bool, str]:
     try:
         local.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return False, str(e)
     rc, _, err = run_rclone(["copyto", spec, str(local), "--no-traverse"],
-                            timeout=3600)
+                            timeout=3600, cancel_event=cancel_event)
     return rc == 0, err.strip()
 
 
@@ -1223,7 +1248,8 @@ def resolve_location(record, drives: list[UsbDrive]
     if not isinstance(record, dict):
         return None, None
     path = record.get("path")
-    if isinstance(path, str) and path and Path(path).is_dir():
+    if isinstance(path, str) and path and (
+            Path(path).is_dir() or is_remote_path(path)):
         return path, None
     label = record.get("label")
     if not isinstance(label, str) or not label:
@@ -1489,8 +1515,12 @@ def verify_copy(src: Path, dst: Path, mode: str) -> tuple[bool, str]:
     return True, ""
 
 
-def build_target_subfolder(file_path: Path, ext: str, sort_mode: str) -> Path:
-    """Return a relative Path describing the sub-folder for this file."""
+def subfolder_for_date(dt: datetime, ext: str, sort_mode: str) -> Path:
+    """Return the relative sub-folder for a file dated `dt`.
+
+    Shared by local files (date from EXIF/mtime) and remote entries (date
+    from the Drive ModTime), so both transports sort identically.
+    """
     if sort_mode == "none":
         return Path(".")
 
@@ -1498,7 +1528,6 @@ def build_target_subfolder(file_path: Path, ext: str, sort_mode: str) -> Path:
     if sort_mode == "file_type":
         return Path(type_folder)
 
-    dt = get_photo_date(file_path)
     year = f"{dt.year:04d}"
     month_named = f"{dt.month:02d}-{MONTH_NAMES[dt.month]}"
     month_num = f"{dt.month:02d}"
@@ -1512,6 +1541,54 @@ def build_target_subfolder(file_path: Path, ext: str, sort_mode: str) -> Path:
     if sort_mode == "year_then_type":  return Path(year) / type_folder
     if sort_mode == "type_then_year":  return Path(type_folder) / year
     return Path(".")
+
+
+def build_target_subfolder(file_path: Path, ext: str, sort_mode: str) -> Path:
+    """Return a relative Path describing the sub-folder for this file."""
+    if sort_mode in ("none", "file_type"):
+        # No date needed — skip the EXIF/mtime lookup entirely.
+        return subfolder_for_date(datetime.now(), ext, sort_mode)
+    return subfolder_for_date(get_photo_date(file_path), ext, sort_mode)
+
+
+def pull_target(dest_root: Path, entry: "RemoteEntry", sort_mode: str) -> Path:
+    """Local destination for a remote entry, sorted like a local file."""
+    dt = entry.modtime or datetime.now()
+    return (dest_root
+            / subfolder_for_date(dt, entry.suffix.lower(), sort_mode)
+            / entry.name)
+
+
+def remote_target(dest_spec: str, subfolder: Path, name: str) -> str:
+    """Full remote spec for `name` placed under `dest_spec`/`subfolder`."""
+    parts = [] if str(subfolder) in ("", ".") else [subfolder.as_posix()]
+    parts.append(name)
+    return join_remote(dest_spec, *parts)
+
+
+def split_remote_name(spec: str) -> tuple[str, str]:
+    """Split a remote spec into (stem, suffix) for rename probing."""
+    remote, _, path = spec.partition(":")
+    head, _, name = path.rpartition("/")
+    stem, suffix = Path(name).stem, Path(name).suffix
+    prefix = f"{remote}:{head}/" if head else f"{remote}:"
+    return f"{prefix}{stem}", suffix
+
+
+def remote_rename_target(spec: str, probe=remote_stat,
+                         limit: int = 999) -> Optional[str]:
+    """Return `spec_2`, `spec_3` … until `probe` reports a free name."""
+    stem, suffix = split_remote_name(spec)
+    for n in range(2, limit + 1):
+        candidate = f"{stem}_{n}{suffix}"
+        if not probe(candidate):
+            return candidate
+    return None
+
+
+def remote_entries_of(files) -> bool:
+    """True when a scan list is made of remote entries (not local paths)."""
+    return bool(files) and all(isinstance(f, RemoteEntry) for f in files)
 
 
 def detect_folder_structure(dest: Path) -> Optional[str]:
@@ -1843,6 +1920,10 @@ class FileOrganizerApp:
         self._detect_job: Optional[str] = None
         self._auto_detected_key: Optional[str] = None
         self.usb_drives: list[UsbDrive] = []
+        self.drive_remotes: list[str] = []
+        self._src_is_remote = False
+        self._dest_is_remote = False
+        self._remote_verify = False
         self._pending_restore: dict[str, dict] = {}
 
         self.scanned_files: list[Path] = []
@@ -1885,7 +1966,7 @@ class FileOrganizerApp:
         self._log_debug(f"Profiles loaded from {PROFILES_FILE}: {len(self.profiles)} entries")
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._update_drives(list_usb_drives())
+        self._update_drives(list_usb_drives(), list_remotes())
         self._restore_locations()
         self.root.after(3000, self._poll_drives)
         self.root.after(100, self._poll_queue)
@@ -2366,6 +2447,13 @@ class FileOrganizerApp:
     #  SOURCE / DESTINATION                                          #
     # ============================================================== #
     def _browse_source(self) -> None:
+        if is_remote_path(self.source_path.get().strip()):
+            messagebox.showinfo(
+                "Google Drive path",
+                "This field holds a Drive path (remote:folder).\n\n"
+                "Type a folder, e.g.  gdrive:Photos\n"
+                "or pick a remote from the drive list.")
+            return
         p = filedialog.askdirectory(title="Select source drive or folder",
                                     initialdir=default_source_dir())
         if p:
@@ -2373,6 +2461,13 @@ class FileOrganizerApp:
             self._log_debug(f"Source set to: {p}")
 
     def _browse_dest(self) -> None:
+        if is_remote_path(self.dest_path.get().strip()):
+            messagebox.showinfo(
+                "Google Drive path",
+                "This field holds a Drive path (remote:folder).\n\n"
+                "Type a folder, e.g.  gdrive:FileOrganizer\n"
+                "or pick a remote from the drive list.")
+            return
         p = filedialog.askdirectory(title="Select destination drive or folder",
                                     initialdir=default_dest_dir())
         if p:
@@ -2383,7 +2478,8 @@ class FileOrganizerApp:
     def _refresh_drives(self) -> None:
         """List drives off the UI thread; result arrives via the queue."""
         threading.Thread(
-            target=lambda: self.msg_queue.put(("drives", list_usb_drives())),
+            target=lambda: self.msg_queue.put(
+                ("drives", (list_usb_drives(), list_remotes()))),
             daemon=True).start()
 
     def _poll_drives(self) -> None:
@@ -2401,20 +2497,27 @@ class FileOrganizerApp:
         """Selection identity that survives mounting/unmounting."""
         return f"dev:{d.device}" if d.device else d.mountpoint
 
-    def _update_drives(self, drives: list[UsbDrive]) -> None:
-        key = [(d.label, d.mountpoint, d.free, d.device) for d in drives]
-        old_key = [(d.label, d.mountpoint, d.free, d.device)
-                   for d in self.usb_drives]
+    def _update_drives(self, drives: list[UsbDrive],
+                       remotes: Optional[list[str]] = None) -> None:
+        drives = list(drives)
+        remotes = list(remotes or [])
         old_drives = self.usb_drives
-        self.usb_drives = drives
-        if key == old_key:
+        old_remotes = list(getattr(self, "drive_remotes", []))
+        key = [(d.label, d.mountpoint, d.free, d.device) for d in drives]
+        old_key = [(d.label, d.mountpoint, d.free, d.device) for d in old_drives]
+        if key == old_key and remotes == old_remotes:
             return
-        values = [self._drive_display(d) for d in drives]
-        idents = [self._drive_ident(d) for d in drives]
+        self.usb_drives = drives
+        self.drive_remotes = remotes
+        values = ([self._drive_display(d) for d in drives]
+                  + [f"☁ {r}: (Google Drive)" for r in remotes])
+        idents = ([self._drive_ident(d) for d in drives]
+                  + [f"remote:{r}" for r in remotes])
+        old_idents = ([self._drive_ident(d) for d in old_drives]
+                      + [f"remote:{r}" for r in old_remotes])
         for combo in (self.src_drive_combo, self.dst_drive_combo):
             old_idx = combo.current()
-            old_ident = (self._drive_ident(old_drives[old_idx])
-                         if 0 <= old_idx < len(old_drives) else None)
+            old_ident = old_idents[old_idx] if 0 <= old_idx < len(old_idents) else None
             combo.configure(values=values)
             if values:
                 combo.configure(state="readonly")
@@ -2423,18 +2526,34 @@ class FileOrganizerApp:
                 else:
                     combo.set("")
             else:
-                combo.set("no USB drives detected")
+                combo.set("no drives or Drive remotes detected")
                 combo.configure(state="disabled")
         self._try_pending_restore()
 
     def _pick_drive(self, kind: str) -> None:
         combo = self.src_drive_combo if kind == "source" else self.dst_drive_combo
         idx = combo.current()
+        var = self.source_path if kind == "source" else self.dest_path
+        hint = self.src_drive_hint if kind == "source" else self.dst_drive_hint
+
+        # Entries after the USB drives are configured rclone remotes.
+        n_usb = len(self.usb_drives)
+        if idx >= n_usb:
+            remotes = list(getattr(self, "drive_remotes", []))
+            remote_idx = idx - n_usb
+            if not (0 <= remote_idx < len(remotes)):
+                return
+            remote = remotes[remote_idx]
+            var.set(f"{remote}:")
+            hint.configure(
+                text=f"Drive root — add a folder, e.g. {remote}:FileOrganizer",
+                foreground=self.colors["text_muted"])
+            self._log_debug(f"{kind} set from Drive picker: {remote}:")
+            return
+
         if idx < 0 or idx >= len(self.usb_drives):
             return
         drive = self.usb_drives[idx]
-        var = self.source_path if kind == "source" else self.dest_path
-        hint = self.src_drive_hint if kind == "source" else self.dst_drive_hint
         if not drive.mounted:
             self._mount_and_pick(kind, drive)
             return
@@ -2698,6 +2817,11 @@ class FileOrganizerApp:
             path = var.get().strip()
             if not path:
                 continue
+            if is_remote_path(path):
+                # Drive paths are remembered verbatim; label resolution is
+                # meaningless for them.
+                self.last_locations[kind] = {"path": path}
+                continue
             record = make_location_record(path, self.usb_drives)
             if "label" not in record and not Path(path).is_dir():
                 # Drive unplugged since the path was set: the old record
@@ -2751,7 +2875,9 @@ class FileOrganizerApp:
             messagebox.showwarning("Busy", "An operation is already running.")
             return
         src = self.source_path.get().strip()
-        if not src or not Path(src).is_dir():
+        if is_remote_path(src):
+            pass          # listing errors surface from the worker
+        elif not src or not Path(src).is_dir():
             messagebox.showerror("Invalid source",
                                  "Please choose a valid source folder or drive.")
             return
@@ -2766,26 +2892,36 @@ class FileOrganizerApp:
         self.cancel_event.clear()
         self.worker = threading.Thread(
             target=self._scan_worker,
-            args=(Path(src), self.include_subdirs.get()),
+            args=(src, self.include_subdirs.get()),
             daemon=True)
         self.worker.start()
 
-    def _scan_worker(self, source: Path, recurse: bool) -> None:
+    def _scan_worker(self, source, recurse: bool) -> None:
         counts: dict[str, int] = defaultdict(int)
         sizes:  dict[str, int] = defaultdict(int)
-        files: list[Path] = []
+        files: list = []
         t0 = time.time()
         try:
-            for p in walk_files(source, recurse, self.cancel_event):
-                files.append(p)
-                ext = p.suffix.lower()
-                counts[ext] += 1
-                try:
-                    sizes[ext] += p.stat().st_size
-                except OSError:
-                    pass
-                if len(files) % 500 == 0:
-                    self.msg_queue.put(("scan_progress", len(files)))
+            if is_remote_path(str(source)):
+                entries = scan_remote(str(source), recurse)
+                for e in entries:
+                    files.append(e)
+                    ext = e.suffix.lower()
+                    counts[ext] += 1
+                    sizes[ext] += e.size
+                    if len(files) % 500 == 0:
+                        self.msg_queue.put(("scan_progress", len(files)))
+            else:
+                for p in walk_files(Path(source), recurse, self.cancel_event):
+                    files.append(p)
+                    ext = p.suffix.lower()
+                    counts[ext] += 1
+                    try:
+                        sizes[ext] += p.stat().st_size
+                    except OSError:
+                        pass
+                    if len(files) % 500 == 0:
+                        self.msg_queue.put(("scan_progress", len(files)))
             elapsed = time.time() - t0
             self.msg_queue.put(("scan_done", (files, dict(counts), dict(sizes), elapsed)))
         except Exception as e:
@@ -2869,16 +3005,39 @@ class FileOrganizerApp:
         if not self.scanned_files:
             messagebox.showerror("Nothing to do", "Scan the source first.")
             return
+        src_text = self.source_path.get().strip()
         dest = self.dest_path.get().strip()
         if not dest:
             messagebox.showerror("Destination",
                                  "Please choose a destination folder.")
             return
-        dest_path = Path(dest)
+
+        src_remote = is_remote_path(src_text)
+        dst_remote = is_remote_path(dest)
+        if src_remote or dst_remote:
+            if rclone_bin() is None:
+                messagebox.showerror(
+                    "Google Drive unavailable",
+                    "rclone is not installed.\n\n"
+                    "Install it, then run:\n\n    rclone config\n\n"
+                    "and address Drive folders as  remote:path\n"
+                    "for example:  gdrive:FileOrganizer")
+                return
+            if src_remote and dst_remote:
+                messagebox.showerror(
+                    "Unsupported",
+                    "Drive → Drive is not supported yet — keep one side local.")
+                return
+
+        self._dest_is_remote = dst_remote
+        self._src_is_remote = src_remote
+        dest_path = None if dst_remote else Path(dest)
 
         mode = self.run_mode.get()
 
-        if mode == "verify":
+        if dst_remote:
+            pass                       # created implicitly by the first upload
+        elif mode == "verify":
             if not dest_path.exists() or not dest_path.is_dir():
                 messagebox.showerror("Destination",
                                      "Destination does not exist — nothing to verify.")
@@ -2891,13 +3050,14 @@ class FileOrganizerApp:
                                      f"Cannot create destination: {e}")
                 return
 
-        try:
-            if dest_path.resolve() == Path(self.source_path.get()).resolve():
-                messagebox.showerror("Invalid",
-                                     "Source and destination are the same folder.")
-                return
-        except Exception:
-            pass
+        if not src_remote and not dst_remote:
+            try:
+                if dest_path.resolve() == Path(src_text).resolve():
+                    messagebox.showerror("Invalid",
+                                         "Source and destination are the same folder.")
+                    return
+            except Exception:
+                pass
 
         selected_exts = {ext for ext, var in self.type_vars.items() if var.get()}
         if not selected_exts:
@@ -2911,10 +3071,16 @@ class FileOrganizerApp:
             messagebox.showinfo("Nothing to do",
                                 "No files match the selected types.")
             return
+        if remote_entries_of(files_to_process) != bool(src_remote):
+            messagebox.showerror("Rescan needed",
+                                 "The scan does not match the current source.\n"
+                                 "Press Scan again.")
+            return
         self._record_locations()
         save_profiles_to_disk(self.profiles, self.current_profile.get(),
                               self.last_locations)
-        total_size = sum(safe_size(p) for p in files_to_process)
+        total_size = sum(safe_size(p) if isinstance(p, Path) else p.size
+                         for p in files_to_process)
 
         sort_label = self.sort_mode_label.get()
         sort_key = SORT_KEY_BY_LABEL.get(sort_label, "none")
@@ -2922,15 +3088,16 @@ class FileOrganizerApp:
         if mode == "verify" and verify == "off":
             verify = "quick"
 
-        # Open the file logger if requested
-        self._maybe_open_file_log(dest_path, mode)
+        # Open the file logger if requested (local destinations only)
+        if not dst_remote:
+            self._maybe_open_file_log(dest_path, mode)
 
         # --- Verify-only branch --- #
         if mode == "verify":
             confirm = messagebox.askyesno(
                 "Confirm verify (read-only)",
                 f"Verify {len(files_to_process):,} source file(s) "
-                f"({human_size(total_size)}) against:\n  {dest_path}\n\n"
+                f"({human_size(total_size)}) against:\n  {dest}\n\n"
                 f"Sort mode:     {sort_label.strip()}\n"
                 f"Double-check:  {dict(VERIFY_MODES)[verify]}\n\n"
                 f"This is read-only — no files will be deleted or modified.\n"
@@ -2945,14 +3112,23 @@ class FileOrganizerApp:
             self.progress_label.configure(
                 text=f"Verifying…  0 / {len(files_to_process):,}")
             self._log_header(
-                f"VERIFY  •  {len(files_to_process):,} files ({human_size(total_size)})  →  {dest_path}")
+                f"VERIFY  •  {len(files_to_process):,} files ({human_size(total_size)})  →  {dest}")
             self._log_info(
                 f"sort: {sort_label.strip()}  •  check: {dict(VERIFY_MODES)[verify]}  •  read-only")
             self.cancel_event.clear()
-            self.worker = threading.Thread(
-                target=self._verify_worker,
-                args=(files_to_process, dest_path, sort_key, verify),
-                daemon=True)
+            if dst_remote or src_remote:
+                self._remote_verify = True
+                # push: compare against the Drive destination;
+                # pull: compare against the local destination
+                remote_root = dest if dst_remote else dest_path
+                direction = "push" if dst_remote else "pull"
+                target = self._verify_remote_worker
+                args = (files_to_process, remote_root, sort_key, verify, direction)
+            else:
+                self._remote_verify = False
+                target = self._verify_worker
+                args = (files_to_process, dest_path, sort_key, verify)
+            self.worker = threading.Thread(target=target, args=args, daemon=True)
             self.worker.start()
             return
 
@@ -2968,8 +3144,11 @@ class FileOrganizerApp:
                        "If 'Double-check' is on, each source is only deleted "
                        "AFTER its copy is verified.")
         if dup == "erase":
-            check = ("SHA-256" if effective_verify == "hash"
-                     else "size + mtime")
+            if src_remote or dst_remote:
+                check = "size + MD5" if effective_verify == "hash" else "size"
+            else:
+                check = ("SHA-256" if effective_verify == "hash"
+                         else "size + mtime")
             warning += ("\n\nNote: 'Erase source' deletes a source file when "
                         f"an identical copy ({check} match) already exists "
                         "at the destination. Same-name files with different "
@@ -2981,7 +3160,7 @@ class FileOrganizerApp:
         confirm = messagebox.askyesno(
             "Confirm",
             f"{verb} {len(files_to_process):,} file(s) "
-            f"({human_size(total_size)}) to:\n  {dest_path}\n\n"
+            f"({human_size(total_size)}) to:\n  {dest}\n\n"
             f"Sort mode:       {sort_label.strip()}\n"
             f"Duplicate mode:  {dict(DUP_MODES)[dup]}\n"
             f"Double-check:    {dict(VERIFY_MODES)[effective_verify]}\n"
@@ -2989,7 +3168,7 @@ class FileOrganizerApp:
         )
         if not confirm:
             return
-        self._format_eligible = True
+        self._format_eligible = not (src_remote or dst_remote)
 
         self._set_controls_running(True)
         self.progress.stop()
@@ -2999,17 +3178,25 @@ class FileOrganizerApp:
             text=f"Starting…  0 / {len(files_to_process):,}")
         self._log_header(
             f"{verb.upper()}  •  {len(files_to_process):,} files "
-            f"({human_size(total_size)})  →  {dest_path}")
+            f"({human_size(total_size)})  →  {dest}")
         self._log_info(
             f"sort: {sort_label.strip()}  •  duplicates: {dict(DUP_MODES)[dup]}  "
             f"•  verify: {dict(VERIFY_MODES)[effective_verify]}  "
             f"•  sync writes: {'on' if self.sync_writes.get() else 'off'}")
 
         self.cancel_event.clear()
-        self.worker = threading.Thread(
-            target=self._transfer_worker,
-            args=(files_to_process, dest_path, op, sort_key, dup, effective_verify),
-            daemon=True)
+        if dst_remote:
+            target = self._push_worker
+            args = (files_to_process, dest, op, sort_key, dup, effective_verify)
+            self._log_info(f"transport: Google Drive  →  {dest}")
+        elif src_remote:
+            target = self._pull_worker
+            args = (files_to_process, dest_path, op, sort_key, dup, effective_verify)
+            self._log_info(f"transport: Google Drive  ←  {src_text}")
+        else:
+            target = self._transfer_worker
+            args = (files_to_process, dest_path, op, sort_key, dup, effective_verify)
+        self.worker = threading.Thread(target=target, args=args, daemon=True)
         self.worker.start()
 
     # ---------------- Verify worker ---------------- #
@@ -3281,6 +3468,324 @@ class FileOrganizerApp:
                             (ok, errors, skipped, overwritten, renamed, erased,
                              verify_fail, total, op, elapsed, bytes_done)))
 
+    # ---------------- Google Drive workers ---------------- #
+    def _push_worker(self, files, dest_spec: str, op: str,
+                     sort_key: str, dup: str, verify: str) -> None:
+        """Upload local files into a Drive folder, honouring op/dup/verify."""
+        verbose = bool(self.verbose_log.get())
+        ok = errors = skipped = overwritten = renamed = erased = verify_fail = 0
+        bytes_done = 0
+        total = len(files)
+        t_start = time.time()
+        last_report = t_start
+
+        for i, src in enumerate(files, start=1):
+            if self.cancel_event.is_set():
+                self.msg_queue.put(("log", (self.LVL_WARN,
+                                            f"Cancelled at {i - 1:,}/{total:,}.")))
+                break
+            t_file = time.time()
+            try:
+                src_size = safe_size(src)
+                subfolder = build_target_subfolder(src, src.suffix.lower(), sort_key)
+                target = remote_target(dest_spec, subfolder, src.name)
+                action_note = ""
+
+                if remote_stat(target) is not None:
+                    if dup == "skip":
+                        skipped += 1
+                        if verbose:
+                            self.msg_queue.put(("log", (self.LVL_DEBUG,
+                                f"  · skip (exists on Drive): {target}")))
+                        self._tick_progress(i, total, src.name, bytes_done,
+                                            t_start, last_report)
+                        last_report = time.time()
+                        continue
+                    if dup == "erase":
+                        # Only ever delete a source whose Drive copy matches.
+                        check = verify if verify != "off" else "quick"
+                        if remote_verify(src, target, check):
+                            try:
+                                src.unlink()
+                                erased += 1
+                                if verbose:
+                                    self.msg_queue.put(("log", (self.LVL_DEBUG,
+                                        f"  · erased source (identical copy on "
+                                        f"Drive): {src.name}")))
+                            except OSError as e:
+                                errors += 1
+                                self.msg_queue.put(("log", (self.LVL_ERROR,
+                                    f"  ✗ could not erase source {src.name}: {e}")))
+                            self._tick_progress(i, total, src.name, bytes_done,
+                                                t_start, last_report)
+                            last_report = time.time()
+                            continue
+                        # Same name, different content — a genuinely new
+                        # file, so keep both instead of deleting anything.
+                        target = remote_rename_target(target) or target
+                        renamed += 1
+                        action_note = " [contents differ — renamed on Drive]"
+                    elif dup == "overwrite":
+                        overwritten += 1
+                        action_note = " [overwrote existing]"
+                    else:                      # rename
+                        target = remote_rename_target(target) or target
+                        renamed += 1
+                        action_note = f" [renamed to {target.rsplit('/', 1)[-1]}]"
+
+                up_ok, up_err = upload_file(src, target,
+                                           cancel_event=self.cancel_event)
+                if not up_ok:
+                    errors += 1
+                    self.msg_queue.put(("log", (self.LVL_ERROR,
+                        f"  ✗ upload failed: {src.name} ({up_err})")))
+                    self._tick_progress(i, total, src.name, bytes_done,
+                                        t_start, last_report)
+                    last_report = time.time()
+                    continue
+                bytes_done += src_size
+
+                # A move must never delete the source on an unconfirmed upload.
+                check = verify if (verify != "off" or op == "move") else "off"
+                if check != "off":
+                    vok, reason = remote_verify(src, target, check)
+                    if not vok:
+                        verify_fail += 1
+                        self.msg_queue.put(("log", (self.LVL_ERROR,
+                            f"  ✗ upload not confirmed: {src.name} ({reason}) "
+                            f"— source kept, bad Drive copy removed")))
+                        delete_remote_file(target)
+                        self._tick_progress(i, total, src.name, bytes_done,
+                                            t_start, last_report)
+                        last_report = time.time()
+                        continue
+
+                if op == "move":
+                    try:
+                        src.unlink()
+                    except OSError as e:
+                        self.msg_queue.put(("log", (self.LVL_WARN,
+                            f"  ! uploaded, but could not remove source "
+                            f"{src.name}: {e}")))
+
+                ok += 1
+                if verbose:
+                    verb = "moved" if op == "move" else "uploaded"
+                    self.msg_queue.put(("log", (self.LVL_DEBUG,
+                        f"  ✓ {verb} {src.name} ({human_size(src_size)})  →  "
+                        f"{target}  in {human_duration(time.time() - t_file)}"
+                        f"{action_note}")))
+
+            except Exception as e:
+                errors += 1
+                self.msg_queue.put(("log", (self.LVL_ERROR,
+                    f"  ✗ {src.name}  →  {e}")))
+
+            now = time.time()
+            if i % 5 == 0 or i == total or (now - last_report) >= 1.0:
+                rate_files = i / (now - t_start) if now > t_start else 0
+                rate_bytes = bytes_done / (now - t_start) if now > t_start else 0
+                self.msg_queue.put(
+                    ("progress",
+                     (i, total, src.name, rate_files, rate_bytes)))
+                last_report = now
+
+        elapsed = time.time() - t_start
+        self.msg_queue.put(("done",
+                            (ok, errors, skipped, overwritten, renamed, erased,
+                             verify_fail, total, op, elapsed, bytes_done)))
+
+    def _pull_worker(self, entries, dest_root: Path, op: str,
+                     sort_key: str, dup: str, verify: str) -> None:
+        """Download Drive entries into a local folder, honouring op/dup/verify."""
+        verbose = bool(self.verbose_log.get())
+        ok = errors = skipped = overwritten = renamed = erased = verify_fail = 0
+        bytes_done = 0
+        total = len(entries)
+        t_start = time.time()
+        last_report = t_start
+
+        for i, entry in enumerate(entries, start=1):
+            if self.cancel_event.is_set():
+                self.msg_queue.put(("log", (self.LVL_WARN,
+                                            f"Cancelled at {i - 1:,}/{total:,}.")))
+                break
+            t_file = time.time()
+            try:
+                target = pull_target(dest_root, entry, sort_key)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                action_note = ""
+
+                if target.exists():
+                    if dup == "skip":
+                        skipped += 1
+                        if verbose:
+                            self.msg_queue.put(("log", (self.LVL_DEBUG,
+                                f"  · skip (exists): {target}")))
+                        self._tick_progress(i, total, entry.name, bytes_done,
+                                            t_start, last_report)
+                        last_report = time.time()
+                        continue
+                    if dup == "erase":
+                        check = verify if verify != "off" else "quick"
+                        if remote_verify(target, entry.path, check):
+                            del_ok, del_err = delete_remote_file(entry.path)
+                            if del_ok:
+                                erased += 1
+                                if verbose:
+                                    self.msg_queue.put(("log", (self.LVL_DEBUG,
+                                        f"  · erased remote (identical local "
+                                        f"copy): {entry.path}")))
+                            else:
+                                errors += 1
+                                self.msg_queue.put(("log", (self.LVL_ERROR,
+                                    f"  ✗ could not erase remote {entry.path}: "
+                                    f"{del_err}")))
+                            self._tick_progress(i, total, entry.name, bytes_done,
+                                                t_start, last_report)
+                            last_report = time.time()
+                            continue
+                        target = unique_destination(target)
+                        renamed += 1
+                        action_note = " [contents differ — renamed locally]"
+                    elif dup == "overwrite":
+                        overwritten += 1
+                        action_note = " [overwrote existing]"
+                    else:                      # rename
+                        target = unique_destination(target)
+                        renamed += 1
+                        action_note = f" [renamed to {target.name}]"
+
+                dl_ok, dl_err = download_file(entry.path, target,
+                                               cancel_event=self.cancel_event)
+                if not dl_ok:
+                    errors += 1
+                    self.msg_queue.put(("log", (self.LVL_ERROR,
+                        f"  ✗ download failed: {entry.name} ({dl_err})")))
+                    self._tick_progress(i, total, entry.name, bytes_done,
+                                        t_start, last_report)
+                    last_report = time.time()
+                    continue
+                bytes_done += entry.size
+
+                check = verify if (verify != "off" or op == "move") else "off"
+                if check != "off":
+                    vok, reason = remote_verify(target, entry.path, check)
+                    if not vok:
+                        verify_fail += 1
+                        self.msg_queue.put(("log", (self.LVL_ERROR,
+                            f"  ✗ verify failed: {entry.name} ({reason}) "
+                            f"— partial download removed, Drive copy kept")))
+                        try:
+                            target.unlink()
+                        except OSError:
+                            pass
+                        self._tick_progress(i, total, entry.name, bytes_done,
+                                            t_start, last_report)
+                        last_report = time.time()
+                        continue
+
+                if op == "move":
+                    del_ok, del_err = delete_remote_file(entry.path)
+                    if not del_ok:
+                        self.msg_queue.put(("log", (self.LVL_WARN,
+                            f"  ! downloaded, but could not remove remote "
+                            f"{entry.path}: {del_err}")))
+
+                ok += 1
+                if verbose:
+                    verb = "moved" if op == "move" else "downloaded"
+                    self.msg_queue.put(("log", (self.LVL_DEBUG,
+                        f"  ✓ {verb} {entry.name} ({human_size(entry.size)})  →  "
+                        f"{target}  in {human_duration(time.time() - t_file)}"
+                        f"{action_note}")))
+
+            except Exception as e:
+                errors += 1
+                self.msg_queue.put(("log", (self.LVL_ERROR,
+                    f"  ✗ {getattr(entry, 'name', '?')}  →  {e}")))
+
+            now = time.time()
+            if i % 5 == 0 or i == total or (now - last_report) >= 1.0:
+                rate_files = i / (now - t_start) if now > t_start else 0
+                rate_bytes = bytes_done / (now - t_start) if now > t_start else 0
+                self.msg_queue.put(
+                    ("progress",
+                     (i, total, entry.name, rate_files, rate_bytes)))
+                last_report = now
+
+        elapsed = time.time() - t_start
+        self.msg_queue.put(("done",
+                            (ok, errors, skipped, overwritten, renamed, erased,
+                             verify_fail, total, op, elapsed, bytes_done)))
+
+    def _verify_remote_worker(self, files, root, sort_key: str,
+                              verify: str, direction: str) -> None:
+        """Read-only check of local↔Drive pairs; pushes verify_done."""
+        verbose = bool(self.verbose_log.get())
+        present = missing = mismatch = errors = 0
+        bytes_seen = 0
+        missing_list: list = []
+        mismatch_list: list = []
+        t_start = time.time()
+        last_report = t_start
+        total = len(files)
+        check = verify if verify != "off" else "quick"
+
+        for i, item in enumerate(files, start=1):
+            if self.cancel_event.is_set():
+                break
+            label = getattr(item, "name", "?")
+            try:
+                if direction == "push":
+                    subfolder = build_target_subfolder(
+                        item, item.suffix.lower(), sort_key)
+                    spec = remote_target(root, subfolder, item.name)
+                    vok, reason = remote_verify(item, spec, check)
+                    size = safe_size(item)
+                else:
+                    target = pull_target(root, item, sort_key)
+                    size = item.size
+                    if not target.exists():
+                        vok, reason = False, "not found locally"
+                    else:
+                        vok, reason = remote_verify(target, item.path, check)
+
+                if vok:
+                    present += 1
+                    bytes_seen += size
+                    if verbose:
+                        self.msg_queue.put(("log", (self.LVL_DEBUG,
+                            f"  ✓ present: {label} ({human_size(size)})")))
+                elif "not found" in reason:
+                    missing += 1
+                    missing_list.append(item)
+                    self.msg_queue.put(("log", (self.LVL_ERROR,
+                        f"  ✗ missing: {label} ({reason})")))
+                else:
+                    mismatch += 1
+                    mismatch_list.append(item)
+                    self.msg_queue.put(("log", (self.LVL_ERROR,
+                        f"  ✗ mismatch: {label} ({reason})")))
+            except Exception as e:
+                errors += 1
+                self.msg_queue.put(("log", (self.LVL_ERROR,
+                                            f"  ✗ error {label}: {e}")))
+
+            now = time.time()
+            if i % 10 == 0 or i == total or (now - last_report) >= 1.0:
+                rate_files = i / (now - t_start) if now > t_start else 0
+                rate_bytes = bytes_seen / (now - t_start) if now > t_start else 0
+                self.msg_queue.put(
+                    ("progress", (i, total, label, rate_files, rate_bytes)))
+                last_report = now
+
+        elapsed = time.time() - t_start
+        self.msg_queue.put(("verify_done",
+                            (present, missing, mismatch, errors, total,
+                             missing_list, mismatch_list, root, sort_key,
+                             elapsed, bytes_seen)))
+
     def _tick_progress(self, i, total, name, bytes_done, t_start, last_report):
         """Send a progress update to the UI thread (helper used inside continue branches)."""
         now = time.time()
@@ -3361,7 +3866,7 @@ class FileOrganizerApp:
                     messagebox.showinfo("Finished", fullsummary)
                     self._maybe_format_source(errors, verify_fail)
                 elif kind == "drives":
-                    self._update_drives(payload)
+                    self._update_drives(*payload)
                 elif kind == "omarchy_theme":
                     self._recheck_omarchy_theme()
                 elif kind == "mount_result":
@@ -3501,6 +4006,18 @@ class FileOrganizerApp:
         self._maybe_close_file_log()
 
         needs_transfer = missing_list + mismatch_list
+        if getattr(self, "_remote_verify", False):
+            if needs_transfer:
+                messagebox.showinfo(
+                    "Verify complete",
+                    f"{fullsummary}\n\n{len(needs_transfer):,} file(s) are missing "
+                    f"or different on the Drive side.\n"
+                    f"Run a transfer to copy them.")
+            else:
+                messagebox.showinfo(
+                    "Verify complete",
+                    f"{fullsummary}\n\nAll files match on the Drive side.")
+            return
         if not needs_transfer:
             messagebox.showinfo("Verify complete",
                                 f"{fullsummary}\n\nAll source files are present at the destination.")
