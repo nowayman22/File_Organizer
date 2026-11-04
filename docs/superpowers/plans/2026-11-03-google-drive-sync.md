@@ -166,8 +166,10 @@ if src_remote and dst_remote:
 
 - [x] **Step 1:** `_update_drives` appends configured remotes to both drive pickers as
   `☁ gdrive:` entries, so a Drive folder can be chosen without typing.
-- [x] **Step 2:** `_browse_source`/`_browse_dest` refuse to open a local dialog when the
-  field holds a remote spec; they explain the `rclone config` workflow instead.
+- [x] **Step 2:** `_browse_source`/`_browse_dest` open a Drive folder chooser when the
+  field holds a remote spec: it lists sub-folders via `list_remote_dirs`, navigates with
+  `remote_parent`/`remote_child`, and fills the field on *Use this folder*. A missing
+  folder is still selectable (it is created on upload).
 - [x] **Step 3:** Remote-aware verification: `_verify_remote_worker` compares each planned
   target (push) or each remote entry against the destination (pull) with size/MD5 and
   reuses the existing summary dialog, labelled "present / missing on Drive".
